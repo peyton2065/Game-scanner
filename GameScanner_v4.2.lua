@@ -1361,6 +1361,11 @@ local function startSpy()
          or method == "InvokeServer"
          or method == "FireAllClients"
          or method == "Fire" then
+            -- LUAU VARARG FIX: capture '...' into a local BEFORE entering the
+            -- nested pcall closure. Luau does not permit '...' to be referenced
+            -- inside a nested non-vararg function (unlike Lua 5.1). The pcall
+            -- wrapper is non-vararg, so '...' inside it is a compile error.
+            local args = { ... }
             -- NO yields inside hook. pcall, string ops, table append only.
             pcall(function()
                 local ok1, cls  = pcall(function() return self.ClassName end)
@@ -1371,15 +1376,15 @@ local function startSpy()
                     cls == "BindableEvent"         or
                     cls == "BindableFunction"      or
                     cls == "UnreliableRemoteEvent") then
-                    local argList = { ... }
                     local line = buildSpyLine(
-                        ok2 and tostring(name) or "<?>", cls, argList)
+                        ok2 and tostring(name) or "<?>", cls, args)
                     ST.spyLines[#ST.spyLines + 1] = line
                     ST.spyDirty = true
                 end
             end)
         end
         -- origNamecall is always populated here -- captured before hook install.
+        -- '...' here is at direct scope of function(self,...) -- valid Luau.
         return origNamecall(self, ...)
     end))
 
