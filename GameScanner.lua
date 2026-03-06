@@ -1,16 +1,13 @@
---[[
-    XENO GAME SCANNER  v3.2  -- Production
-    ========================================
-    Tabs:  TREE | SCRIPTS | REMOTES | PROPS
-    Toggle GUI:  RightShift
-    Safe re-execute.  Pure ASCII throughout.
-]]
+-- XenoScanner v4.0 -- Production -- Pure ASCII -- Safe re-execute
+-- Tabs: TREE | SCRIPTS | REMOTES | PROPS
+-- Keybind: RightShift = toggle GUI
+-- All 11 diagnostic findings resolved.
 
 -- ============================================================
---  S0  UNC SHIMS
---  Every exploit API shimmed.  Nothing can throw "nil value"
---  from a missing global.  newcclosure MUST be shimmed because
---  Xeno's hookmetamethod requires a C closure.
+-- S0  UNC SHIMS
+-- Every exploit API shimmed before anything else runs.
+-- newcclosure MUST be shimmed: Xeno hookmetamethod needs a C closure.
+-- gethui MUST be shimmed: used as pcall arg, nil check alone is unsafe.
 -- ============================================================
 if not cloneref          then cloneref          = function(o) return o   end end
 if not getnilinstances   then getnilinstances   = function()  return {}  end end
@@ -24,6 +21,7 @@ if not getgc             then getgc             = function()  return {}  end end
 if not checkcaller       then checkcaller       = function()  return false end end
 if not newcclosure       then newcclosure       = function(f) return f   end end
 if not getnamecallmethod then getnamecallmethod = function()  return ""  end end
+if not gethui            then gethui            = function()  return nil end end
 if not hookmetamethod    then hookmetamethod    = nil end
 if not setclipboard      then
     setclipboard = function()
@@ -32,7 +30,7 @@ if not setclipboard      then
 end
 
 -- ============================================================
---  S1  SERVICES
+-- S1  SERVICES
 -- ============================================================
 local Players = cloneref(game:GetService("Players"))
 local UIS     = cloneref(game:GetService("UserInputService"))
@@ -40,7 +38,7 @@ local CoreGui = cloneref(game:GetService("CoreGui"))
 local LP      = Players.LocalPlayer
 
 -- ============================================================
---  S2  GUI PARENT  (Xeno: CoreGui first, then gethui, then PlayerGui)
+-- S2  GUI PARENT  (Xeno: CoreGui -> gethui -> PlayerGui)
 -- ============================================================
 local GUI_PARENT
 do
@@ -51,47 +49,51 @@ do
     end)
     if ok then
         GUI_PARENT = CoreGui
-    elseif gethui then
-        local ok2, hui = pcall(gethui)
-        GUI_PARENT = (ok2 and hui) or LP:WaitForChild("PlayerGui")
     else
-        GUI_PARENT = LP:WaitForChild("PlayerGui")
+        local ok2, hui = pcall(gethui)
+        if ok2 and hui and typeof(hui) == "Instance" then
+            GUI_PARENT = hui
+        else
+            GUI_PARENT = LP:WaitForChild("PlayerGui")
+        end
     end
 end
 
 -- ============================================================
---  S3  CLEANUP  (search all possible parents on re-execute)
+-- S3  CLEANUP  (destroy any previous instance from all parents)
 -- ============================================================
+local SCRIPT_NAME = "XenoScannerV4"
+
 local function destroyOld()
-    local name = "XenoScannerV3"
-    local candidates = { CoreGui }
-    local pGui = LP:FindFirstChild("PlayerGui")
-    if pGui then candidates[#candidates+1] = pGui end
-    if gethui then
-        local ok, hui = pcall(gethui)
-        if ok and hui then candidates[#candidates+1] = hui end
+    local parents = { CoreGui }
+    local pg = LP:FindFirstChild("PlayerGui")
+    if pg then parents[#parents + 1] = pg end
+    local ok2, hui = pcall(gethui)
+    if ok2 and hui and typeof(hui) == "Instance" then
+        parents[#parents + 1] = hui
     end
-    for _, p in ipairs(candidates) do
-        local old = p:FindFirstChild(name)
+    for _, p in ipairs(parents) do
+        local old = p:FindFirstChild(SCRIPT_NAME)
         if old then pcall(function() old:Destroy() end) end
     end
 end
 destroyOld()
 
 -- ============================================================
---  S4  CONFIG
+-- S4  CONFIG
 -- ============================================================
 local C = {
     ROOTS = {
-        "Workspace","Players","Lighting","MaterialService",
-        "ReplicatedFirst","ReplicatedStorage","ServerScriptService",
-        "ServerStorage","StarterGui","StarterPack","StarterPlayer",
-        "Teams","SoundService","TextChatService","CoreGui",
+        "Workspace", "Players", "Lighting", "MaterialService",
+        "ReplicatedFirst", "ReplicatedStorage", "ServerScriptService",
+        "ServerStorage", "StarterGui", "StarterPack", "StarterPlayer",
+        "Teams", "SoundService", "TextChatService", "CoreGui",
     },
     SKIP      = { Terrain = true },
     MAX_DEPTH = 64,
     CHUNK     = 175000,
     W = 740, H = 520,
+    -- Palette
     BG      = Color3.fromRGB( 12,  12,  18),
     SURFACE = Color3.fromRGB( 20,  20,  30),
     HEADER  = Color3.fromRGB( 18,  18,  28),
@@ -104,82 +106,97 @@ local C = {
     SPY_COL = Color3.fromRGB(220, 160,  40),
     GREEN   = Color3.fromRGB( 40, 180, 100),
     GREY    = Color3.fromRGB( 80,  80, 110),
+    FILTER_DEBOUNCE = 0.15,
+    SPY_POLL_RATE   = 0.25,
 }
 
 -- ============================================================
---  S5  STATE
+-- S5  STATE
 -- ============================================================
 local ST = {
     activeTab      = "TREE",
     guiVisible     = true,
+    -- FIX 3.1: scan mutex -- prevents concurrent scan coroutines
+    scanning       = false,
+    -- Spy state
     spyActive      = false,
-    spyOriginal    = nil,
-    spyLines       = {},
+    spyOriginal    = nil,     -- original __namecall, restored on stopSpy
+    spyLines       = {},      -- hook ONLY appends here, never yields
+    spyRenderThread = nil,    -- separate task.spawn poll loop
+    spyDirty       = false,   -- signals render thread a new line arrived
+    -- Data caches
     treeText       = nil,
     scriptList     = {},
     remoteList     = {},
     selectedScript = nil,
     propsText      = nil,
     filterText     = "",
+    -- FIX 3.4: debounce handle for filter callback
+    filterDebounce = nil,
 }
 
 -- ============================================================
---  S6  UTILITY
+-- S6  UTILITY
 -- ============================================================
+
+-- Safe property read: never throws
 local function SP(inst, prop)
     local ok, v = pcall(function() return inst[prop] end)
     return ok and tostring(v) or "<?>"
 end
 
+-- Split string into chunks <= C.CHUNK, splitting on newline boundaries
 local function chunkStr(str)
     local out, s, len = {}, 1, #str
     while s <= len do
         local e = math.min(s + C.CHUNK - 1, len)
         if e < len then
             for i = e, s, -1 do
-                if str:sub(i,i) == "\n" then e = i; break end
+                if str:sub(i, i) == "\n" then e = i; break end
             end
         end
-        out[#out+1] = str:sub(s, e)
+        out[#out + 1] = str:sub(s, e)
         s = e + 1
     end
     return out
 end
 
+-- Build full DataModel path string for any instance
 local function fullPath(inst)
     if inst == game then return "game" end
     local parts, cur = {}, inst
     while cur and cur ~= game do
         local ok, n = pcall(function() return cur.Name end)
-        parts[#parts+1] = ok and tostring(n) or "<?>"
+        parts[#parts + 1] = ok and tostring(n) or "<?>"
         local ok2, p = pcall(function() return cur.Parent end)
         if not ok2 or p == nil then break end
         cur = p
     end
     local rev = {}
-    for i = #parts, 1, -1 do rev[#rev+1] = parts[i] end
+    for i = #parts, 1, -1 do rev[#rev + 1] = parts[i] end
     return "game." .. table.concat(rev, ".")
 end
 
+-- Add 5-digit line numbers to a source string
 local function numberLines(src)
     local out, n = {}, 0
     for line in (src .. "\n"):gmatch("([^\n]*)\n") do
         n = n + 1
-        out[#out+1] = string.format("%5d  %s", n, line)
+        out[#out + 1] = string.format("%5d  %s", n, line)
     end
     return table.concat(out, "\n"), n
 end
 
 -- ============================================================
---  S7  SCANNERS
+-- S7  SCANNERS
 -- ============================================================
 
--- S7-A  TREE
+-- S7-A  TREE ------------------------------------------------
 local function buildTree()
     local lines = {}
-    local function ins(s) lines[#lines+1] = s end
+    local function ins(s) lines[#lines + 1] = s end
 
-    ins("XENO GAME SCANNER v3.2  --  Full Hierarchy")
+    ins("XENO GAME SCANNER v4.0  --  Full Hierarchy")
     ins("Game:    " .. SP(game, "Name"))
     ins("PlaceId: " .. SP(game, "PlaceId"))
     ins("JobId:   " .. SP(game, "JobId"))
@@ -189,18 +206,18 @@ local function buildTree()
     local function recurse(inst, prefix, isLast, depth)
         if type(lines) ~= "table" then return end
         if depth > C.MAX_DEPTH then
-            lines[#lines+1] = prefix
+            lines[#lines + 1] = prefix
                 .. (isLast and "\\- " or "|- ") .. "[MAX DEPTH]"
             return
         end
         local br   = isLast and "\\- " or "|- "
         local name = SP(inst, "Name")
         local cls  = SP(inst, "ClassName")
-        lines[#lines+1] = prefix .. br .. name .. "  [" .. cls .. "]"
+        lines[#lines + 1] = prefix .. br .. name .. "  [" .. cls .. "]"
 
         if C.SKIP[cls] then
             local cp = prefix .. (isLast and "   " or "|  ")
-            lines[#lines+1] = cp .. "\\- ... (skipped)"
+            lines[#lines + 1] = cp .. "\\- ... (skipped)"
             return
         end
 
@@ -216,9 +233,9 @@ local function buildTree()
         local ok, svc = pcall(function() return game:GetService(svcName) end)
         if ok and svc then
             local ok2, ch = pcall(function() return svc:GetChildren() end)
-            local count = (ok2 and type(ch)=="table") and #ch or 0
+            local count = (ok2 and type(ch) == "table") and #ch or 0
             ins(">> " .. svcName
-                .. "  [" .. SP(svc,"ClassName") .. "]"
+                .. "  [" .. SP(svc, "ClassName") .. "]"
                 .. "  (" .. count .. " children)")
             if ok2 and type(ch) == "table" then
                 for i = 1, #ch do
@@ -234,7 +251,7 @@ local function buildTree()
     return table.concat(lines, "\n")
 end
 
--- S7-B  SCRIPTS
+-- S7-B  SCRIPTS ---------------------------------------------
 local function buildScriptList()
     local list, seen = {}, {}
 
@@ -244,10 +261,10 @@ local function buildScriptList()
             if not seen[s] then
                 seen[s] = true
                 local ok2, cls  = pcall(function() return s.ClassName end)
-                local ok3, name = pcall(function() return s.Name end)
-                if ok2 and (cls=="LocalScript" or cls=="Script"
-                            or cls=="ModuleScript") then
-                    list[#list+1] = {
+                local ok3, name = pcall(function() return s.Name      end)
+                if ok2 and (cls == "LocalScript" or cls == "Script"
+                            or cls == "ModuleScript") then
+                    list[#list + 1] = {
                         name     = ok3 and tostring(name) or "<?>",
                         cls      = cls,
                         path     = fullPath(s),
@@ -258,6 +275,7 @@ local function buildScriptList()
         end
     end
 
+    -- Fallback: walk all instances if getscripts returned nothing
     if #list == 0 then
         local ok2, all = pcall(getinstances)
         if ok2 and type(all) == "table" then
@@ -265,10 +283,10 @@ local function buildScriptList()
                 if not seen[s] then
                     seen[s] = true
                     local ok3, cls = pcall(function() return s.ClassName end)
-                    if ok3 and (cls=="LocalScript" or cls=="Script"
-                                or cls=="ModuleScript") then
+                    if ok3 and (cls == "LocalScript" or cls == "Script"
+                                or cls == "ModuleScript") then
                         local ok4, name = pcall(function() return s.Name end)
-                        list[#list+1] = {
+                        list[#list + 1] = {
                             name     = ok4 and tostring(name) or "<?>",
                             cls      = cls,
                             path     = fullPath(s),
@@ -287,68 +305,73 @@ end
 local function decompileScript(entry)
     local inst = entry.instance
 
+    -- Attempt 1: decompile() -- full source reconstruction
     local ok1, src = pcall(decompile, inst)
-    if ok1 and type(src)=="string" and #src > 0 then
+    if ok1 and type(src) == "string" and #src > 0 then
         local numbered, n = numberLines(src)
         return numbered, n, "decompile()"
     end
 
+    -- Attempt 2: closure analysis (constants + upvalues)
     local ok2, closure = pcall(getscriptclosure, inst)
     if ok2 and closure then
         local buf = {}
-        buf[#buf+1] = "-- decompile() unavailable for this script."
-        buf[#buf+1] = "-- Fallback: closure analysis (constants + upvalues)"
-        buf[#buf+1] = "--"
-        buf[#buf+1] = "-- CONSTANTS:"
+        buf[#buf + 1] = "-- decompile() unavailable for this script."
+        buf[#buf + 1] = "-- Fallback: closure analysis"
+        buf[#buf + 1] = "--"
+        buf[#buf + 1] = "-- CONSTANTS:"
         local ok3, consts = pcall(getconstants, closure)
-        if ok3 and type(consts)=="table" then
+        if ok3 and type(consts) == "table" then
             for i, v in ipairs(consts) do
-                buf[#buf+1] = string.format("--   [%d] %s", i, tostring(v))
+                buf[#buf + 1] = string.format("--   [%d] %s", i, tostring(v))
             end
         else
-            buf[#buf+1] = "--   (none)"
+            buf[#buf + 1] = "--   (none)"
         end
-        buf[#buf+1] = "--"
-        buf[#buf+1] = "-- UPVALUES:"
+        buf[#buf + 1] = "--"
+        buf[#buf + 1] = "-- UPVALUES:"
         local ok4, ups = pcall(getupvalues, closure)
-        if ok4 and type(ups)=="table" then
+        if ok4 and type(ups) == "table" then
             for k, v in pairs(ups) do
-                buf[#buf+1] = string.format("--   [%s] = %s",
-                    tostring(k), tostring(v))
+                buf[#buf + 1] = string.format(
+                    "--   [%s] = %s", tostring(k), tostring(v))
             end
         else
-            buf[#buf+1] = "--   (none)"
+            buf[#buf + 1] = "--   (none)"
         end
         local numbered, n = numberLines(table.concat(buf, "\n"))
         return numbered, n, "closure dump"
     end
 
+    -- Attempt 3: graceful unavailable
     local fallback = "-- Source unavailable.\n"
         .. "-- Script is protected or obfuscated."
     local numbered, n = numberLines(fallback)
     return numbered, n, "unavailable"
 end
 
--- S7-C  REMOTES
+-- S7-C  REMOTES ---------------------------------------------
 local function buildRemoteList()
     local list, seen = {}, {}
     local TARGET = {
-        RemoteEvent=true, RemoteFunction=true,
-        BindableEvent=true, BindableFunction=true,
-        UnreliableRemoteEvent=true,
+        RemoteEvent            = true,
+        RemoteFunction         = true,
+        BindableEvent          = true,
+        BindableFunction       = true,
+        UnreliableRemoteEvent  = true,
     }
 
     local function scanRoot(root)
         if not root then return end
         local ok, desc = pcall(function() return root:GetDescendants() end)
-        if not ok or type(desc)~="table" then return end
+        if not ok or type(desc) ~= "table" then return end
         for _, inst in ipairs(desc) do
             if not seen[inst] then
                 seen[inst] = true
                 local ok2, cls = pcall(function() return inst.ClassName end)
                 if ok2 and TARGET[cls] then
                     local ok3, name = pcall(function() return inst.Name end)
-                    list[#list+1] = {
+                    list[#list + 1] = {
                         name     = ok3 and tostring(name) or "<?>",
                         cls      = cls,
                         path     = fullPath(inst),
@@ -364,15 +387,16 @@ local function buildRemoteList()
         if ok and svc then scanRoot(svc) end
     end
 
+    -- Hidden nil-parented remotes
     local okN, nilInsts = pcall(getnilinstances)
-    if okN and type(nilInsts)=="table" then
+    if okN and type(nilInsts) == "table" then
         for _, inst in ipairs(nilInsts) do
             if not seen[inst] then
                 seen[inst] = true
                 local ok2, cls = pcall(function() return inst.ClassName end)
                 if ok2 and TARGET[cls] then
                     local ok3, name = pcall(function() return inst.Name end)
-                    list[#list+1] = {
+                    list[#list + 1] = {
                         name     = ok3 and tostring(name) or "<?>",
                         cls      = cls,
                         path     = "(nil-parent) " .. (ok3 and tostring(name) or "<?>"),
@@ -387,30 +411,32 @@ local function buildRemoteList()
     return list
 end
 
--- S7-D  PROPERTIES
+-- S7-D  PROPERTIES ------------------------------------------
 local function buildPropsText(inst)
     if not inst then return "No instance selected." end
     local lines = {}
-    local function ins(s) lines[#lines+1] = s end
+    local function ins(s) lines[#lines + 1] = s end
 
-    ins("PROPERTIES  --  " .. SP(inst,"Name")
-        .. "  [" .. SP(inst,"ClassName") .. "]")
+    ins("PROPERTIES  --  " .. SP(inst, "Name")
+        .. "  [" .. SP(inst, "ClassName") .. "]")
     ins("Full path: " .. fullPath(inst))
     ins(string.rep("-", 56))
     ins("")
 
     local PROPS = {
-        "Name","ClassName","Parent","Archivable","Locked",
-        "Position","Orientation","Size","CFrame",
-        "Color","BrickColor","Material","Transparency",
-        "Anchored","CanCollide","CanQuery","CastShadow","Massless","RootPriority",
-        "Health","MaxHealth","WalkSpeed","JumpPower","JumpHeight","DisplayName",
-        "Disabled","RunContext","Source",
+        "Name", "ClassName", "Parent", "Archivable", "Locked",
+        "Position", "Orientation", "Size", "CFrame",
+        "Color", "BrickColor", "Material", "Transparency",
+        "Anchored", "CanCollide", "CanQuery", "CastShadow",
+        "Massless", "RootPriority",
+        "Health", "MaxHealth", "WalkSpeed", "JumpPower",
+        "JumpHeight", "DisplayName",
+        "Disabled", "RunContext", "Source",
         "Value",
-        "SoundId","Volume","PlayOnRemove","IsPlaying","Looped",
-        "Text","TextColor3","Font","TextSize","BackgroundColor3",
-        "Size","Position","Visible","ZIndex",
-        "RespawnLocation","Team","TeamColor","Neutral",
+        "SoundId", "Volume", "PlayOnRemove", "IsPlaying", "Looped",
+        "Text", "TextColor3", "Font", "TextSize", "BackgroundColor3",
+        "Visible", "ZIndex",
+        "RespawnLocation", "Team", "TeamColor", "Neutral",
     }
 
     for _, p in ipairs(PROPS) do
@@ -422,24 +448,62 @@ local function buildPropsText(inst)
 
     ins("")
     local okC, ch = pcall(function() return inst:GetChildren() end)
-    local childCount = (okC and type(ch)=="table") and #ch or 0
+    local childCount = (okC and type(ch) == "table") and #ch or 0
     ins("CHILDREN  (" .. childCount .. ")")
-    if okC and type(ch)=="table" then
+    if okC and type(ch) == "table" then
         for _, child in ipairs(ch) do
-            ins("    " .. SP(child,"Name")
-                .. "  [" .. SP(child,"ClassName") .. "]")
+            ins("    " .. SP(child, "Name")
+                .. "  [" .. SP(child, "ClassName") .. "]")
         end
     end
 
     return table.concat(lines, "\n")
 end
 
+-- FIX 4.2: incremental path resolver with per-segment diagnostics
+local function resolvePath(pathStr)
+    local f = pathStr:gsub("^%s+", ""):gsub("%s+$", "")
+    if f == "" then return nil, "empty path" end
+
+    local parts = {}
+    for p in f:gmatch("[^%.]+") do parts[#parts + 1] = p end
+
+    if parts[1] ~= "game" and parts[1] ~= "Game" then
+        return nil, "path must start with 'game' (got '" .. parts[1] .. "')"
+    end
+
+    local cur = game
+    for i = 2, #parts do
+        local seg  = parts[i]
+        local child = cur:FindFirstChild(seg)
+        if child then
+            cur = child
+        else
+            -- Try as a service (only valid directly under game)
+            local ok2, svc = pcall(function() return game:GetService(seg) end)
+            if ok2 and svc and typeof(svc) == "Instance" then
+                cur = svc
+            else
+                local parentName = (i == 2) and "game"
+                    or parts[i - 1]
+                return nil, "could not find '" .. seg
+                    .. "' under " .. parentName
+            end
+        end
+    end
+
+    if typeof(cur) ~= "Instance" then
+        return nil, "resolved value is not an Instance"
+    end
+    return cur, nil
+end
+
 -- ============================================================
---  S8  GUI
+-- S8  GUI CONSTRUCTION
 -- ============================================================
 
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name            = "XenoScannerV3"
+ScreenGui.Name            = SCRIPT_NAME
 ScreenGui.ResetOnSpawn    = false
 ScreenGui.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
 ScreenGui.IgnoreGuiInset  = true
@@ -448,7 +512,7 @@ ScreenGui.Parent          = GUI_PARENT
 local Main = Instance.new("Frame")
 Main.Name             = "Main"
 Main.Size             = UDim2.new(0, C.W, 0, C.H)
-Main.Position         = UDim2.new(0.5, -(C.W/2), 0.5, -(C.H/2))
+Main.Position         = UDim2.new(0.5, -(C.W / 2), 0.5, -(C.H / 2))
 Main.BackgroundColor3 = C.BG
 Main.BorderSizePixel  = 0
 Main.ClipsDescendants = true
@@ -483,7 +547,7 @@ Stripe.Parent           = TitleBar
 Instance.new("UICorner", Stripe).CornerRadius = UDim.new(0, 2)
 
 local TitleLbl = Instance.new("TextLabel")
-TitleLbl.Text               = "XENO GAME SCANNER  v3.2"
+TitleLbl.Text               = "XENO GAME SCANNER  v4.0"
 TitleLbl.Size               = UDim2.new(1, -100, 1, 0)
 TitleLbl.Position           = UDim2.new(0, 20, 0, 0)
 TitleLbl.BackgroundTransparency = 1
@@ -567,7 +631,7 @@ Instance.new("UICorner", FilterBar).CornerRadius = UDim.new(0, 5)
 local FilterLbl = Instance.new("TextLabel")
 FilterLbl.Text              = "Filter:"
 FilterLbl.Size              = UDim2.new(0, 40, 1, 0)
-FilterLbl.Position          = UDim2.new(0, 4, 0, 0)
+FilterLbl.Position          = UDim2.new(0, 6, 0, 0)
 FilterLbl.BackgroundTransparency = 1
 FilterLbl.TextColor3        = C.DIM
 FilterLbl.Font              = Enum.Font.GothamBold
@@ -581,7 +645,7 @@ FilterInput.Size              = UDim2.new(1, -76, 1, 0)
 FilterInput.Position          = UDim2.new(0, 46, 0, 0)
 FilterInput.BackgroundTransparency = 1
 FilterInput.TextColor3        = C.TEXT
-FilterInput.PlaceholderText   = "type to filter by name or class..."
+FilterInput.PlaceholderText   = "type to filter..."
 FilterInput.PlaceholderColor3 = C.DIM
 FilterInput.Font              = Enum.Font.Code
 FilterInput.TextSize          = 11
@@ -640,6 +704,8 @@ ListScroll.BorderSizePixel      = 0
 ListScroll.ScrollBarThickness   = 4
 ListScroll.ScrollBarImageColor3 = C.ACCENT
 ListScroll.CanvasSize           = UDim2.new(0, 0, 0, 0)
+-- FIX 4.3: AutomaticCanvasSize eliminates manual height calculation error
+ListScroll.AutomaticCanvasSize  = Enum.AutomaticSize.Y
 ListScroll.ZIndex               = 4
 ListScroll.Parent               = ListPanel
 
@@ -649,12 +715,12 @@ ListItemLayout.Padding   = UDim.new(0, 2)
 ListItemLayout.Parent    = ListScroll
 
 local UIPadList = Instance.new("UIPadding")
-UIPadList.PaddingLeft  = UDim.new(0, 4)
-UIPadList.PaddingTop   = UDim.new(0, 4)
-UIPadList.PaddingRight = UDim.new(0, 4)
-UIPadList.Parent       = ListScroll
+UIPadList.PaddingLeft   = UDim.new(0, 4)
+UIPadList.PaddingTop    = UDim.new(0, 4)
+UIPadList.PaddingRight  = UDim.new(0, 4)
+UIPadList.Parent        = ListScroll
 
--- Source/detail panel (SCRIPTS / REMOTES right pane)
+-- Source / detail panel (SCRIPTS / REMOTES right pane)
 local SourceScroll = Instance.new("ScrollingFrame")
 SourceScroll.Name                 = "SourceScroll"
 SourceScroll.Size                 = UDim2.new(1, -230, 1, -152)
@@ -727,18 +793,18 @@ local function makeBtn(label, col, w)
     return b
 end
 
-local BtnScan      = makeBtn("[ SCAN ]",         C.GREEN,    90)
-local BtnCopyMain  = makeBtn("[ COPY ALL ]",      C.ACCENT,  110)
-local BtnCopyItem  = makeBtn("[ COPY SEL ]",      C.ACCENT,  100)
-local BtnSpyToggle = makeBtn("[ SPY: OFF ]",      C.SPY_COL, 110)
-local BtnClearSpy  = makeBtn("[ CLR SPY ]",       C.GREY,     90)
+local BtnScan      = makeBtn("[ SCAN ]",       C.GREEN,     90)
+local BtnCopyMain  = makeBtn("[ COPY ALL ]",   C.ACCENT,   110)
+local BtnCopyItem  = makeBtn("[ COPY SEL ]",   C.ACCENT,   100)
+local BtnSpyToggle = makeBtn("[ SPY: OFF ]",   C.SPY_COL,  110)
+local BtnClearSpy  = makeBtn("[ CLR SPY ]",    C.GREY,      90)
 
 BtnCopyItem.Visible  = false
 BtnSpyToggle.Visible = false
 BtnClearSpy.Visible  = false
 
 -- ============================================================
---  S9  RENDER HELPERS
+-- S9  RENDER HELPERS
 -- ============================================================
 
 local function setStatus(msg)
@@ -746,16 +812,22 @@ local function setStatus(msg)
 end
 
 local function clearFrame(sf)
-    for _, c in ipairs(sf:GetChildren()) do
-        if c:IsA("TextLabel") or c:IsA("Frame") or c:IsA("TextButton") then
-            c:Destroy()
+    for _, child in ipairs(sf:GetChildren()) do
+        if child:IsA("TextLabel")
+            or child:IsA("Frame")
+            or child:IsA("TextButton") then
+            child:Destroy()
         end
     end
 end
 
+-- FIX 3.3 + 3.2: CanvasSize reset first; lbl.Parent guard in chunk loop
 local function renderText(sf, text, col)
+    -- FIX 3.3: reset canvas before building new content
+    sf.CanvasSize = UDim2.new(0, 0, 0, 0)
     clearFrame(sf)
     col = col or C.TEXT
+
     if not text or #text == 0 then
         local lbl = Instance.new("TextLabel")
         lbl.Size             = UDim2.new(1, 0, 0, 20)
@@ -791,11 +863,14 @@ local function renderText(sf, text, col)
         lbl.Parent                 = sf
         task.wait()
 
-        local bounds = lbl.TextBounds
-        local h = bounds.Y + 4
-        local w = bounds.X + 14
-        lbl.Size = UDim2.new(0, math.max(w, sf.AbsoluteSize.X - 8), 0, h)
-        if w > maxW then maxW = w end
+        -- FIX 3.2: guard against label being destroyed by a concurrent clearFrame
+        if lbl and lbl.Parent then
+            local bounds = lbl.TextBounds
+            local h = bounds.Y + 4
+            local w = bounds.X + 14
+            lbl.Size = UDim2.new(0, math.max(w, sf.AbsoluteSize.X - 8), 0, h)
+            if w > maxW then maxW = w end
+        end
     end
 
     sf.CanvasSize = UDim2.new(0, maxW, 0, 0)
@@ -865,12 +940,13 @@ local function renderList(items, onSelect, filterStr)
         end
     end
 
-    ListScroll.CanvasSize = UDim2.new(0, 0, 0, shown * 40 + 8)
-    setStatus(shown .. "/" .. #items .. " shown  |  filter: '" .. filter .. "'")
+    -- FIX 4.3: AutomaticCanvasSize = Y handles height; no manual calculation
+    setStatus(shown .. "/" .. #items .. " shown  |  filter: '"
+        .. filter .. "'")
 end
 
 -- ============================================================
---  S10  TAB SWITCHING
+-- S10  TAB SWITCHING
 -- ============================================================
 local function switchTab(name)
     ST.activeTab = name
@@ -882,7 +958,6 @@ local function switchTab(name)
     BtnCopyItem.Visible   = false
     BtnSpyToggle.Visible  = false
     BtnClearSpy.Visible   = false
-    BtnScan.Visible       = true
     BtnCopyMain.Text      = "[ COPY ALL ]"
 
     for tname, tb in pairs(tabButtons) do
@@ -927,10 +1002,30 @@ for _, tname in ipairs(TAB_NAMES) do
 end
 
 -- ============================================================
---  S11  SCAN ACTIONS
+-- S11  SCAN ACTIONS
+-- Each function: (1) acquires mutex, (2) runs scan, (3) releases
+-- mutex in all exit paths including error.  FIX 3.1.
+-- FIX 4.1: all terminal BtnScan writes guarded with .Parent check.
 -- ============================================================
 
+local function releaseScan(text, label)
+    -- FIX 4.1: guard button writes after yield -- GUI may have been destroyed
+    if BtnScan and BtnScan.Parent then
+        BtnScan.Active = true
+        BtnScan.Text   = label
+    end
+    ST.scanning = false
+    if text then setStatus(text) end
+end
+
+-- TREE
 local function doScanTree()
+    -- FIX 3.1: mutex acquisition
+    if ST.scanning then
+        setStatus("A scan is already running. Please wait.")
+        return
+    end
+    ST.scanning    = true
     BtnScan.Active = false
     BtnScan.Text   = "scanning..."
     setStatus("Building tree...")
@@ -948,7 +1043,7 @@ local function doScanTree()
         local filtered = {}
         for line in (result .. "\n"):gmatch("([^\n]*)\n") do
             if line:lower():find(f, 1, true) then
-                filtered[#filtered+1] = line
+                filtered[#filtered + 1] = line
             end
         end
         display = #filtered > 0
@@ -960,14 +1055,19 @@ local function doScanTree()
 
     local lc = 0
     for _ in result:gmatch("\n") do lc = lc + 1 end
-    setStatus("Tree: " .. lc .. " lines, " .. #result .. " chars")
-    BtnScan.Active = true
-    BtnScan.Text   = "[ SCAN TREE ]"
+    releaseScan("Tree: " .. lc .. " lines, " .. #result .. " chars",
+        "[ SCAN TREE ]")
 end
 
+-- SCRIPTS
 local function doScanScripts()
-    BtnScan.Active = false
-    BtnScan.Text   = "scanning..."
+    if ST.scanning then
+        setStatus("A scan is already running. Please wait.")
+        return
+    end
+    ST.scanning       = true
+    BtnScan.Active    = false
+    BtnScan.Text      = "scanning..."
     setStatus("Enumerating scripts...")
     clearFrame(ListScroll)
     clearFrame(SourceScroll)
@@ -989,21 +1089,24 @@ local function doScanScripts()
     end
 
     renderList(ST.scriptList, onScriptSelect, ST.filterText)
-    setStatus("Scripts found: " .. #ST.scriptList)
-    BtnScan.Active = true
-    BtnScan.Text   = "[ SCAN SCRIPTS ]"
+    releaseScan("Scripts found: " .. #ST.scriptList, "[ SCAN SCRIPTS ]")
 end
 
+-- Spy line formatter (used by hook AND by render thread)
 local function buildSpyLine(name, cls, args)
     local parts = {}
-    for _, a in ipairs(args) do
-        parts[#parts+1] = tostring(a)
-    end
+    for _, a in ipairs(args) do parts[#parts + 1] = tostring(a) end
     return string.format("[SPY] %-28s [%s]  args: (%s)",
         name, cls, table.concat(parts, ", "))
 end
 
+-- REMOTES
 local function doScanRemotes()
+    if ST.scanning then
+        setStatus("A scan is already running. Please wait.")
+        return
+    end
+    ST.scanning    = true
     BtnScan.Active = false
     BtnScan.Text   = "scanning..."
     setStatus("Enumerating remotes...")
@@ -1032,12 +1135,16 @@ local function doScanRemotes()
     end
 
     renderList(ST.remoteList, onRemoteSelect, ST.filterText)
-    setStatus("Remotes found: " .. #ST.remoteList)
-    BtnScan.Active = true
-    BtnScan.Text   = "[ SCAN REMOTES ]"
+    releaseScan("Remotes found: " .. #ST.remoteList, "[ SCAN REMOTES ]")
 end
 
+-- PROPS
 local function doScanProps()
+    if ST.scanning then
+        setStatus("A scan is already running. Please wait.")
+        return
+    end
+    ST.scanning    = true
     BtnScan.Active = false
     BtnScan.Text   = "scanning..."
     clearFrame(ContentScroll)
@@ -1049,59 +1156,38 @@ local function doScanProps()
         .. "Then click [ SCAN PROPS ] to inspect it.\n"
 
     local f = ST.filterText:gsub("^%s+", ""):gsub("%s+$", "")
-    local resolved = nil
 
     if f ~= "" then
-        local ok, inst = pcall(function()
-            local parts = {}
-            for p in f:gmatch("[^%.]+") do parts[#parts+1] = p end
-            if parts[1] ~= "game" and parts[1] ~= "Game" then
-                return nil
-            end
-            local cur = game
-            for i = 2, #parts do
-                local child = cur:FindFirstChild(parts[i])
-                if child then
-                    cur = child
-                else
-                    local ok2, svc = pcall(function()
-                        return game:GetService(parts[i])
-                    end)
-                    if ok2 and svc then
-                        cur = svc
-                    else
-                        return nil
-                    end
-                end
-            end
-            return cur
-        end)
-        if ok and inst and typeof(inst) == "Instance" then
-            resolved = inst
+        -- FIX 4.2: resolvePath returns (instance, nil) or (nil, errorMsg)
+        local inst, errMsg = resolvePath(f)
+        if inst then
+            local propsText = buildPropsText(inst)
+            ST.propsText = propsText
+            renderText(ContentScroll, propsText, C.TEXT)
+            releaseScan("Properties: " .. SP(inst, "Name")
+                .. "  [" .. SP(inst, "ClassName") .. "]",
+                "[ SCAN PROPS ]")
+        else
+            ST.propsText = hint
+            renderText(ContentScroll, hint, C.DIM)
+            releaseScan("[PROPS] " .. (errMsg or "unknown error"),
+                "[ SCAN PROPS ]")
         end
-    end
-
-    if resolved then
-        local propsText = buildPropsText(resolved)
-        ST.propsText = propsText
-        renderText(ContentScroll, propsText, C.TEXT)
-        setStatus("Properties: " .. SP(resolved,"Name")
-            .. "  [" .. SP(resolved,"ClassName") .. "]")
     else
         ST.propsText = hint
         renderText(ContentScroll, hint, C.DIM)
-        if f ~= "" then
-            setStatus("Could not resolve: '" .. f .. "'")
-        else
-            setStatus("Enter an instance path in the filter bar, then click SCAN PROPS.")
-        end
+        releaseScan(
+            "Enter an instance path in the filter bar, then click SCAN PROPS.",
+            "[ SCAN PROPS ]")
     end
-
-    BtnScan.Active = true
-    BtnScan.Text   = "[ SCAN PROPS ]"
 end
 
--- Spy
+-- ============================================================
+-- S12  REMOTE SPY
+-- FIX 2.1: hook NEVER yields. Separate task.spawn render loop.
+-- FIX 2.2: stopSpy restores original metamethod via hookmetamethod.
+-- ============================================================
+
 local function startSpy()
     if ST.spyActive then return end
     if not hookmetamethod then
@@ -1110,15 +1196,40 @@ local function startSpy()
     end
 
     ST.spyActive = true
+    ST.spyDirty  = false
     BtnSpyToggle.Text             = "[ SPY: ON ]"
     BtnSpyToggle.BackgroundColor3 = Color3.fromRGB(220, 80, 80)
 
+    -- FIX 2.1: render loop runs on its own coroutine, completely separate
+    -- from the hook. The hook only appends to ST.spyLines and sets ST.spyDirty.
+    ST.spyRenderThread = task.spawn(function()
+        local lastCount = 0
+        while ST.spyActive do
+            if ST.spyDirty and #ST.spyLines ~= lastCount then
+                ST.spyDirty = false
+                lastCount   = #ST.spyLines
+                if ST.activeTab == "REMOTES" then
+                    local spyText = table.concat(ST.spyLines, "\n")
+                    -- renderText yields via task.wait -- safe here (own thread)
+                    pcall(renderText, SourceScroll, spyText, C.SPY_COL)
+                    setStatus("SPY: " .. lastCount .. " calls captured")
+                end
+            end
+            task.wait(C.SPY_POLL_RATE)
+        end
+    end)
+
+    -- origNamecall MUST be stored before the hook is installed so the
+    -- closure captures the correct upvalue reference.
     local origNamecall
     origNamecall = hookmetamethod(game, "__namecall",
         newcclosure(function(self, ...)
             local method = getnamecallmethod()
-            if method == "FireServer"     or method == "InvokeServer"
-            or method == "FireAllClients" or method == "Fire" then
+            if  method == "FireServer"
+             or method == "InvokeServer"
+             or method == "FireAllClients"
+             or method == "Fire" then
+                -- FIX 2.1: NO yields here. pcall, string ops, table append only.
                 pcall(function()
                     local ok1, cls  = pcall(function() return self.ClassName end)
                     local ok2, name = pcall(function() return self.Name      end)
@@ -1128,19 +1239,15 @@ local function startSpy()
                         cls == "BindableEvent"          or
                         cls == "BindableFunction"       or
                         cls == "UnreliableRemoteEvent") then
-                        local args = { ... }
+                        local argList = { ... }
                         local line = buildSpyLine(
-                            ok2 and tostring(name) or "<?>", cls, args)
-                        ST.spyLines[#ST.spyLines+1] = line
-                        if ST.activeTab == "REMOTES"
-                                and #ST.spyLines % 5 == 0 then
-                            local spyText = table.concat(ST.spyLines, "\n")
-                            renderText(SourceScroll, spyText, C.SPY_COL)
-                            setStatus("SPY: " .. #ST.spyLines .. " calls captured")
-                        end
+                            ok2 and tostring(name) or "<?>", cls, argList)
+                        ST.spyLines[#ST.spyLines + 1] = line
+                        ST.spyDirty = true
                     end
                 end)
             end
+            -- Always call original -- never swallow the call
             return origNamecall(self, ...)
         end)
     )
@@ -1150,14 +1257,25 @@ local function startSpy()
 end
 
 local function stopSpy()
+    if not ST.spyActive then return end
     ST.spyActive = false
+
+    -- FIX 2.2: restore the original __namecall metamethod
+    if hookmetamethod and ST.spyOriginal then
+        pcall(function()
+            hookmetamethod(game, "__namecall", ST.spyOriginal)
+        end)
+    end
+    ST.spyOriginal    = nil
+    ST.spyRenderThread = nil
+
     BtnSpyToggle.Text             = "[ SPY: OFF ]"
     BtnSpyToggle.BackgroundColor3 = C.SPY_COL
     setStatus("SPY stopped -- " .. #ST.spyLines .. " calls captured.")
 end
 
 -- ============================================================
---  S12  BUTTON WIRING
+-- S13  BUTTON WIRING
 -- ============================================================
 
 CloseBtn.MouseButton1Click:Connect(function()
@@ -1185,6 +1303,7 @@ BtnCopyMain.MouseButton1Click:Connect(function()
 
     if tab == "TREE" then
         text = ST.treeText or ""
+
     elseif tab == "SCRIPTS" then
         if #ST.scriptList == 0 then
             setStatus("No scripts scanned yet.")
@@ -1194,26 +1313,28 @@ BtnCopyMain.MouseButton1Click:Connect(function()
         local parts = {}
         for i, item in ipairs(ST.scriptList) do
             setStatus("Decompiling " .. i .. "/" .. #ST.scriptList
-                .. " (" .. item.name .. ")...")
+                .. "  (" .. item.name .. ")...")
             task.wait()
             local src, lineCount, method = decompileScript(item)
-            parts[#parts+1] = string.rep("=", 60)
-            parts[#parts+1] = "-- [" .. i .. "]  " .. item.path
-            parts[#parts+1] = "-- Class: " .. item.cls
-            parts[#parts+1] = "-- Lines: " .. lineCount
+            parts[#parts + 1] = string.rep("=", 60)
+            parts[#parts + 1] = "-- [" .. i .. "]  " .. item.path
+            parts[#parts + 1] = "-- Class: " .. item.cls
+            parts[#parts + 1] = "-- Lines: " .. lineCount
                 .. "  |  Method: " .. method
-            parts[#parts+1] = string.rep("=", 60)
-            parts[#parts+1] = src
-            parts[#parts+1] = ""
+            parts[#parts + 1] = string.rep("=", 60)
+            parts[#parts + 1] = src
+            parts[#parts + 1] = ""
         end
         text = table.concat(parts, "\n")
         BtnCopyMain.Active = true
+
     elseif tab == "REMOTES" then
         local rows = {}
         for _, r in ipairs(ST.remoteList) do
-            rows[#rows+1] = r.path .. "  [" .. r.cls .. "]"
+            rows[#rows + 1] = r.path .. "  [" .. r.cls .. "]"
         end
         text = table.concat(rows, "\n")
+
     elseif tab == "PROPS" then
         text = ST.propsText or ""
     end
@@ -1227,6 +1348,7 @@ BtnCopyMain.MouseButton1Click:Connect(function()
         BtnCopyMain.BackgroundColor3 = C.GREEN
         setStatus("Copied " .. #text .. " chars to clipboard.")
         task.delay(2.5, function()
+            -- FIX 4.1: guard after delay -- GUI may have been closed
             if BtnCopyMain and BtnCopyMain.Parent then
                 BtnCopyMain.Text             = prev
                 BtnCopyMain.BackgroundColor3 = C.ACCENT
@@ -1247,6 +1369,7 @@ BtnCopyItem.MouseButton1Click:Connect(function()
         BtnCopyItem.BackgroundColor3 = C.GREEN
         setStatus("Copied " .. #text .. " chars.")
         task.delay(2.5, function()
+            -- FIX 4.1: guard after delay
             if BtnCopyItem and BtnCopyItem.Parent then
                 BtnCopyItem.Text             = prev
                 BtnCopyItem.BackgroundColor3 = C.ACCENT
@@ -1267,18 +1390,46 @@ BtnClearSpy.MouseButton1Click:Connect(function()
     setStatus("Spy log cleared.")
 end)
 
-FilterInput:GetPropertyChangedSignal("Text"):Connect(function()
-    ST.filterText = FilterInput.Text
-    local f = ST.filterText:lower()
+-- ============================================================
+-- S14  FILTER (with debounce)
+-- FIX 3.4: 150ms debounce prevents per-keystroke full re-renders.
+-- ============================================================
 
-    if ST.activeTab == "TREE" and ST.treeText then
+-- Shared select callbacks (needed by filter re-render)
+local function makeScriptSelectFn()
+    return function(item)
+        setStatus("Decompiling: " .. item.name .. "...")
+        clearFrame(SourceScroll)
+        task.wait()
+        local src, lineCount, method = decompileScript(item)
+        ST.selectedScript = src
+        renderText(SourceScroll, src, C.TEXT)
+        setStatus(item.path .. "  |  " .. lineCount
+            .. " lines  |  via " .. method)
+    end
+end
+
+local function makeRemoteSelectFn()
+    return function(item)
+        ST.selectedScript = item.path
+        local detail = "Path:  " .. item.path .. "\nClass: " .. item.cls
+        renderText(SourceScroll, detail, C.TEXT)
+        setStatus(item.path)
+    end
+end
+
+local function applyFilter()
+    local f = ST.filterText:lower()
+    local tab = ST.activeTab
+
+    if tab == "TREE" and ST.treeText then
         if f == "" then
             renderText(ContentScroll, ST.treeText, C.TEXT)
         else
             local filtered = {}
             for line in (ST.treeText .. "\n"):gmatch("([^\n]*)\n") do
                 if line:lower():find(f, 1, true) then
-                    filtered[#filtered+1] = line
+                    filtered[#filtered + 1] = line
                 end
             end
             local display = #filtered > 0
@@ -1287,34 +1438,41 @@ FilterInput:GetPropertyChangedSignal("Text"):Connect(function()
             renderText(ContentScroll, display, C.TEXT)
             setStatus(#filtered .. " lines match '" .. f .. "'")
         end
-    elseif ST.activeTab == "SCRIPTS" and #ST.scriptList > 0 then
-        renderList(ST.scriptList, function(item)
-            setStatus("Decompiling: " .. item.name .. "...")
-            clearFrame(SourceScroll)
-            task.wait()
-            local src, lineCount, method = decompileScript(item)
-            ST.selectedScript = src
-            renderText(SourceScroll, src, C.TEXT)
-            setStatus(item.path .. "  |  " .. lineCount
-                .. " lines  |  via " .. method)
-        end, ST.filterText)
-    elseif ST.activeTab == "REMOTES" and #ST.remoteList > 0 then
-        renderList(ST.remoteList, function(item)
-            ST.selectedScript = item.path
-            renderText(SourceScroll,
-                "Path:  " .. item.path .. "\nClass: " .. item.cls, C.TEXT)
-            setStatus(item.path)
-        end, ST.filterText)
+
+    elseif tab == "SCRIPTS" and #ST.scriptList > 0 then
+        renderList(ST.scriptList, makeScriptSelectFn(), ST.filterText)
+
+    elseif tab == "REMOTES" and #ST.remoteList > 0 then
+        renderList(ST.remoteList, makeRemoteSelectFn(), ST.filterText)
     end
+end
+
+FilterInput:GetPropertyChangedSignal("Text"):Connect(function()
+    ST.filterText = FilterInput.Text
+
+    -- FIX 3.4: cancel any pending debounce and schedule a new one
+    if ST.filterDebounce then
+        task.cancel(ST.filterDebounce)
+        ST.filterDebounce = nil
+    end
+    ST.filterDebounce = task.delay(C.FILTER_DEBOUNCE, function()
+        ST.filterDebounce = nil
+        applyFilter()
+    end)
 end)
 
 FilterClear.MouseButton1Click:Connect(function()
+    if ST.filterDebounce then
+        task.cancel(ST.filterDebounce)
+        ST.filterDebounce = nil
+    end
     FilterInput.Text = ""
     ST.filterText    = ""
+    applyFilter()
 end)
 
 -- ============================================================
---  S13  DRAG
+-- S15  DRAG
 -- ============================================================
 local dragging, dragStart, dragOrigin
 
@@ -1342,7 +1500,7 @@ UIS.InputChanged:Connect(function(inp)
 end)
 
 -- ============================================================
---  S14  KEYBIND  (RightShift toggles GUI)
+-- S16  KEYBIND  (RightShift toggles GUI visibility)
 -- ============================================================
 UIS.InputBegan:Connect(function(inp, gpe)
     if not gpe and inp.KeyCode == Enum.KeyCode.RightShift then
@@ -1352,7 +1510,7 @@ UIS.InputBegan:Connect(function(inp, gpe)
 end)
 
 -- ============================================================
---  S15  INIT
+-- S17  INIT
 -- ============================================================
-setStatus("XenoScanner v3.2 ready  --  select a tab and press SCAN")
-print("[XenoScanner v3.2] Loaded. GUI parent: " .. tostring(GUI_PARENT))
+setStatus("XenoScanner v4.0  --  GUI parent: " .. tostring(GUI_PARENT))
+print("[XenoScanner v4.0] Loaded. GUI parent: " .. tostring(GUI_PARENT))
