@@ -996,6 +996,12 @@ end
 -- Runs Tree, Remotes, and Scripts sequentially in a single task.spawn.
 -- Updates ST.treeText / ST.remoteList / ST.scriptList as side effects,
 -- so individual tabs are also populated after a full scan completes.
+-- How many scripts to decompile between each scheduler yield.
+-- Each task.wait() costs one full frame (~16ms at 60fps).
+-- Batching 15 at a time cuts yield overhead by 15x vs per-script yields
+-- while still keeping the label responsive enough to feel live.
+local DECOMPILE_BATCH = 15
+
 local function doFullScan()
     if ST.scanning then
         notify("Busy", "A scan is already running.", "clock", 3)
@@ -1003,21 +1009,41 @@ local function doFullScan()
     end
     ST.scanning = true
 
-    -- Local helper: updates both the global status and the Full Scan tab label.
+    local SEP = string.rep("=", 64)
+    local DIV = string.rep("-", 64)
+
+    -- Local helper: updates status bar + Full Scan label.
+    -- Does NOT touch FullScanParagraph during decompile — paragraph updates
+    -- only happen on progressive commits (see below) to avoid Rayfield
+    -- choking on rapid paragraph :Set() calls in a tight loop.
     local function setFull(msg)
         setStatus(msg)
         if UI.FullScanLabel then
             pcall(function() UI.FullScanLabel:Set(msg) end)
         end
-        if UI.FullScanParagraph then
-            pcall(function()
-                UI.FullScanParagraph:Set({ Title = "Full Game Scan — In Progress", Content = msg })
-            end)
-        end
     end
 
-    local SEP = string.rep("=", 64)
-    local DIV = string.rep("-", 64)
+    -- Commits whatever is currently assembled into ST.fullScanText so the
+    -- copy button returns real data even if the scan is still mid-decompile.
+    -- inProgress flag appends a "(scan in progress)" marker to the footer
+    -- so the user knows the copy is partial.
+    local function commit(parts, inProgress, scriptsCompleted, scriptsTotal)
+        local body = table.concat(parts, "\n")
+        local footer
+        if inProgress then
+            footer = "\n" .. SEP
+                .. "\nFULL SCAN IN PROGRESS  --  scripts: "
+                .. (scriptsCompleted or 0) .. "/" .. (scriptsTotal or "?")
+                .. "  --  " .. #body .. " chars so far"
+                .. "\n" .. SEP
+        else
+            footer = "\n" .. SEP
+                .. "\nEND OF FULL SCAN  --  " .. #body .. " chars total"
+                .. "\n" .. SEP
+        end
+        ST.fullScanText = body .. footer
+    end
+
     local parts = {}
 
     -- ---- HEADER ----
@@ -1032,15 +1058,12 @@ local function doFullScan()
 
     -- ---- STEP 1: TREE ----
     setFull("Step 1/3: Building hierarchy tree...")
-    task.wait()
+    task.wait()  -- one yield to let the label render before CPU-bound buildTree
 
     local ok1, treeResult = pcall(buildTree)
-    if not ok1 then
-        treeResult = "[TREE ERROR]: " .. tostring(treeResult)
-    end
+    if not ok1 then treeResult = "[TREE ERROR]: " .. tostring(treeResult) end
     ST.treeText = treeResult
 
-    -- Side-effect: update Tree tab
     local treeLc = 0
     for _ in treeResult:gmatch("\n") do treeLc = treeLc + 1 end
     if UI.TreeScanLabel then
@@ -1064,9 +1087,7 @@ local function doFullScan()
     setFull("Step 2/3: Enumerating remotes...")
     task.wait()
 
-    local ok2, remErr = pcall(function()
-        ST.remoteList = buildRemoteList()
-    end)
+    local ok2, remErr = pcall(function() ST.remoteList = buildRemoteList() end)
 
     if not ok2 then
         parts[#parts + 1] = "[SECTION 2: REMOTES]"
@@ -1074,7 +1095,6 @@ local function doFullScan()
         parts[#parts + 1] = "[REMOTES ERROR]: " .. tostring(remErr)
         parts[#parts + 1] = ""
     else
-        -- Side-effect: update Remotes tab
         rebuildRemoteDropdown(ST.remoteFilter)
         if UI.RemoteScanLabel then
             pcall(function() UI.RemoteScanLabel:Set("Remotes found: " .. #ST.remoteList .. "  (via Full Scan)") end)
@@ -1096,17 +1116,16 @@ local function doFullScan()
     setFull("Step 3/3: Enumerating scripts...")
     task.wait()
 
-    local ok3, scrErr = pcall(function()
-        ST.scriptList = buildScriptList()
-    end)
+    local ok3, scrErr = pcall(function() ST.scriptList = buildScriptList() end)
 
     if not ok3 then
         parts[#parts + 1] = "[SECTION 3: SCRIPTS]"
         parts[#parts + 1] = DIV
         parts[#parts + 1] = "[SCRIPTS ERROR]: " .. tostring(scrErr)
         parts[#parts + 1] = ""
+        -- Tree + Remotes are done and usable — commit now so Copy works.
+        commit(parts, false)
     else
-        -- Side-effect: update Scripts tab
         rebuildScriptDropdown(ST.scriptFilter)
         if UI.ScriptScanLabel then
             pcall(function() UI.ScriptScanLabel:Set("Scripts found: " .. #ST.scriptList .. "  (via Full Scan)") end)
@@ -1120,13 +1139,35 @@ local function doFullScan()
         if ST.fullScanIncludeSources then
             scrRows[#scrRows + 1] = "(decompiled sources included)"
             scrRows[#scrRows + 1] = ""
-            -- Snapshot the list so mutations mid-loop don't affect iteration
+
             local snapshot = {}
             for i, v in ipairs(ST.scriptList) do snapshot[i] = v end
+            local total = #snapshot
 
+            -- ---- PROGRESSIVE COMMIT: Tree + Remotes + script header ----
+            -- Copy button becomes functional RIGHT NOW with partial data.
+            -- The footer will say "scan in progress" until decompile finishes.
+            local earlyParts = {}
+            for _, v in ipairs(parts) do earlyParts[#earlyParts + 1] = v end
+            for _, v in ipairs(scrRows) do earlyParts[#earlyParts + 1] = v end
+            earlyParts[#earlyParts + 1] = "(decompilation starting — copy again when complete)"
+            commit(earlyParts, true, 0, total)
+
+            -- ---- DECOMPILE LOOP: batch yields ----
             for i, item in ipairs(snapshot) do
-                setFull("Step 3/3: Decompiling " .. i .. "/" .. #snapshot .. "  —  " .. item.name)
-                task.wait()
+                -- Yield only at batch boundaries, not every script.
+                -- Keeps the label live without a full frame-wait per script.
+                if i % DECOMPILE_BATCH == 1 then
+                    setFull("Step 3/3: Decompiling " .. i .. "/" .. total .. "  —  " .. item.name)
+                    task.wait()
+                    -- Progressive commit every batch so Copy always has fresh data.
+                    local progressParts = {}
+                    for _, v in ipairs(parts) do progressParts[#progressParts + 1] = v end
+                    for _, v in ipairs(scrRows) do progressParts[#progressParts + 1] = v end
+                    progressParts[#progressParts + 1] = "(...decompiling " .. i .. "/" .. total .. "...)"
+                    commit(progressParts, true, i - 1, total)
+                end
+
                 local src, lineCount, method = decompileScript(item)
                 scrRows[#scrRows + 1] = string.rep("=", 60)
                 scrRows[#scrRows + 1] = "-- [" .. i .. "]  " .. item.path
@@ -1136,6 +1177,7 @@ local function doFullScan()
                 scrRows[#scrRows + 1] = src
                 scrRows[#scrRows + 1] = ""
             end
+
         else
             scrRows[#scrRows + 1] = "(sources excluded — enable 'Include Script Sources' toggle to include)"
             scrRows[#scrRows + 1] = ""
@@ -1148,20 +1190,12 @@ local function doFullScan()
         parts[#parts + 1] = ""
     end
 
-    -- ---- FOOTER ----
-    -- Concatenate body first so footer can reference the true char count.
-    local body = table.concat(parts, "\n")
-    local footer = "\n" .. SEP
-        .. "\nEND OF FULL SCAN  --  " .. #body .. " chars total"
-        .. "\n" .. SEP
-    ST.fullScanText = body .. footer
+    -- ---- FINAL COMMIT ----
+    commit(parts, false)
 
     local totalChars = #ST.fullScanText
     local doneMsg = "Full scan complete — " .. totalChars .. " chars"
-    setStatus(doneMsg)
-    if UI.FullScanLabel then
-        pcall(function() UI.FullScanLabel:Set(doneMsg) end)
-    end
+    setFull(doneMsg)
     if UI.FullScanParagraph then
         pcall(function()
             UI.FullScanParagraph:Set({
