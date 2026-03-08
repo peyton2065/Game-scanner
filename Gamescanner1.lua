@@ -1196,11 +1196,69 @@ local function doFullScan()
     local totalChars = #ST.fullScanText
     local doneMsg = "Full scan complete — " .. totalChars .. " chars"
     setFull(doneMsg)
+
     if UI.FullScanParagraph then
         pcall(function()
+            -- Section-aware preview: take a fixed slice of lines from each
+            -- section independently so tree never starves remotes/scripts.
+            -- Truncating the flat fullScanText string fails because the tree
+            -- alone fills the entire char budget before remotes appear.
+            local PREVIEW_LINES_PER_SECTION = 18
+            local SEP_PREVIEW = string.rep("=", 40)
+            local previewParts = {}
+
+            local function addSection(label, text)
+                previewParts[#previewParts + 1] = SEP_PREVIEW
+                previewParts[#previewParts + 1] = label
+                previewParts[#previewParts + 1] = SEP_PREVIEW
+                if not text or text == "" then
+                    previewParts[#previewParts + 1] = "(no data)"
+                else
+                    local lines = {}
+                    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+                        lines[#lines + 1] = line
+                        if #lines >= PREVIEW_LINES_PER_SECTION then break end
+                    end
+                    previewParts[#previewParts + 1] = table.concat(lines, "\n")
+                    previewParts[#previewParts + 1] = "(... use Copy for full output)"
+                end
+                previewParts[#previewParts + 1] = ""
+            end
+
+            -- Tree
+            addSection("HIERARCHY TREE", ST.treeText or "")
+
+            -- Remotes
+            local remPreview = ""
+            if #ST.remoteList > 0 then
+                local rows = {}
+                for i, r in ipairs(ST.remoteList) do
+                    rows[#rows + 1] = r.path .. "  [" .. r.cls .. "]"
+                    if i >= PREVIEW_LINES_PER_SECTION then break end
+                end
+                remPreview = #ST.remoteList .. " remotes found\n" .. table.concat(rows, "\n")
+            end
+            addSection("REMOTES  (" .. #ST.remoteList .. ")", remPreview)
+
+            -- Scripts
+            local scrPreview = ""
+            if #ST.scriptList > 0 then
+                local rows = {}
+                for i, s in ipairs(ST.scriptList) do
+                    rows[#rows + 1] = s.path .. "  [" .. s.cls .. "]"
+                    if i >= PREVIEW_LINES_PER_SECTION then break end
+                end
+                scrPreview = #ST.scriptList .. " scripts found\n" .. table.concat(rows, "\n")
+            end
+            local scrLabel = "SCRIPTS  (" .. #ST.scriptList .. ")"
+            if ST.fullScanIncludeSources then
+                scrLabel = scrLabel .. "  — sources in clipboard output"
+            end
+            addSection(scrLabel, scrPreview)
+
             UI.FullScanParagraph:Set({
-                Title   = "Full Scan Output  (" .. totalChars .. " chars)",
-                Content = truncate(ST.fullScanText, C.MAX_PARA_TREE),
+                Title   = "Full Scan Preview  (" .. totalChars .. " chars total — Copy for full output)",
+                Content = table.concat(previewParts, "\n"),
             })
         end)
     end
