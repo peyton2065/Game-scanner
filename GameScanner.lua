@@ -1,7 +1,7 @@
 -- XenoScanner v4.0 -- Production -- Pure ASCII -- Safe re-execute
 -- Tabs: TREE | SCRIPTS | REMOTES | PROPS
 -- Keybind: RightShift = toggle GUI
--- All 14 diagnostic findings resolved.
+-- All 15 diagnostic findings resolved.
 --
 -- Applied fixes:
 --   H-001: ContentScroll CanvasSize fixed via AutomaticCanvasSize
@@ -18,6 +18,7 @@
 --   H-012: Bulk copy snapshots scriptList and guards mid-copy state
 --   H-013: Dead type(lines) guard removed from buildTree
 --   H-014: GUI_PARENT test validates actual parenting success
+--   H-015: Vararg capture before nested closure (Luau scoping fix)
 
 -- ============================================================
 -- S0  UNC SHIMS
@@ -1305,6 +1306,9 @@ local function startSpy()
              or method == "InvokeServer"
              or method == "FireAllClients"
              or method == "Fire" then
+                -- [FIX H-015] Capture varargs BEFORE entering nested closure.
+                -- Luau forbids '...' inside non-vararg inner functions.
+                local args = {...}
                 pcall(function()
                     local ok1, cls  = pcall(function() return self.ClassName end)
                     local ok2, name = pcall(function() return self.Name      end)
@@ -1314,9 +1318,8 @@ local function startSpy()
                         cls == "BindableEvent"          or
                         cls == "BindableFunction"       or
                         cls == "UnreliableRemoteEvent") then
-                        local argList = { ... }
                         local line = buildSpyLine(
-                            ok2 and tostring(name) or "<?>", cls, argList)
+                            ok2 and tostring(name) or "<?>", cls, args)
                         ST.spyLines[#ST.spyLines + 1] = line
                         ST.spyDirty = true
                     end
