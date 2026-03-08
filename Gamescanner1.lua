@@ -1130,7 +1130,7 @@ local _MAIN_OK, _MAIN_ERR = pcall(function()
         LoadingTitle           = "XenoScanner v4.2",
         LoadingSubtitle        = "Rayfield Edition",
         Theme                  = "Default",
-        ToggleUIKeybind        = "RightShift",
+        ToggleUIKeybind        = Enum.KeyCode.RightShift,
         DisableRayfieldPrompts = true,
         DisableBuildWarnings   = true,
         ConfigurationSaving    = { Enabled = false },
