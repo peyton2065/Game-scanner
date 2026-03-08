@@ -1,9 +1,14 @@
 -- XenoScanner v4.2  --  Rayfield Edition  --  Production  --  Safe re-execute
--- Tabs: TREE | SCRIPTS | REMOTES | PROPERTIES | INFO
+-- Tabs: TREE | SCRIPTS | REMOTES | PROPERTIES | FULL SCAN | INFO
 -- Keybind: RightShift = toggle GUI  (UIS fallback — Rayfield:SetVisibility)
 -- Load via Bootstrap.lua -- do NOT use raw loadstring(game:HttpGet(...))()
 -- ============================================================
 -- CHANGELOG
+-- v4.2 Full Scan:
+--   Added Tab 5: Full Scan. Single button runs Tree + Remotes + Scripts
+--   sequentially, assembles unified output document, stores in
+--   ST.fullScanText. Toggle: Include Script Sources (default ON).
+--   Side-effects: updates Tree, Remotes, Scripts tab state in parallel.
 -- v4.2 Rayfield Fix Pass:
 --   H1: Removed ToggleUIKeybind from CreateWindow — crashes strict Rayfield
 --       builds regardless of string vs Enum.KeyCode value. UIS fallback added
@@ -193,6 +198,9 @@ local ST = {
     selectedScriptSource = nil,
     selectedRemotePath   = nil,
     propsText           = nil,
+    -- Full Scan cache
+    fullScanText           = nil,
+    fullScanIncludeSources = true,
     -- Spy state
     spyActive      = false,
     spyOriginal    = nil,
@@ -227,6 +235,10 @@ local UI = {
     PropsLabel       = nil,
     PropsParagraph   = nil,
     PropsInput       = nil,
+    -- FULL SCAN tab
+    FullScanLabel     = nil,
+    FullScanParagraph = nil,
+    FullScanToggle    = nil,
     -- INFO tab
     StatusLabel      = nil,
     InfoParagraph    = nil,
@@ -980,6 +992,189 @@ local function doScanProps()
     ST.scanning = false
 end
 
+-- FULL SCAN
+-- Runs Tree, Remotes, and Scripts sequentially in a single task.spawn.
+-- Updates ST.treeText / ST.remoteList / ST.scriptList as side effects,
+-- so individual tabs are also populated after a full scan completes.
+local function doFullScan()
+    if ST.scanning then
+        notify("Busy", "A scan is already running.", "clock", 3)
+        return
+    end
+    ST.scanning = true
+
+    -- Local helper: updates both the global status and the Full Scan tab label.
+    local function setFull(msg)
+        setStatus(msg)
+        if UI.FullScanLabel then
+            pcall(function() UI.FullScanLabel:Set(msg) end)
+        end
+        if UI.FullScanParagraph then
+            pcall(function()
+                UI.FullScanParagraph:Set({ Title = "Full Game Scan — In Progress", Content = msg })
+            end)
+        end
+    end
+
+    local SEP = string.rep("=", 64)
+    local DIV = string.rep("-", 64)
+    local parts = {}
+
+    -- ---- HEADER ----
+    parts[#parts + 1] = SEP
+    parts[#parts + 1] = "XENO GAME SCANNER v4.2  --  FULL GAME SCAN"
+    parts[#parts + 1] = "Game:    " .. SP(game, "Name")
+    parts[#parts + 1] = "PlaceId: " .. SP(game, "PlaceId")
+    parts[#parts + 1] = "JobId:   " .. SP(game, "JobId")
+    parts[#parts + 1] = "Sources: " .. (ST.fullScanIncludeSources and "included" or "excluded")
+    parts[#parts + 1] = SEP
+    parts[#parts + 1] = ""
+
+    -- ---- STEP 1: TREE ----
+    setFull("Step 1/3: Building hierarchy tree...")
+    task.wait()
+
+    local ok1, treeResult = pcall(buildTree)
+    if not ok1 then
+        treeResult = "[TREE ERROR]: " .. tostring(treeResult)
+    end
+    ST.treeText = treeResult
+
+    -- Side-effect: update Tree tab
+    local treeLc = 0
+    for _ in treeResult:gmatch("\n") do treeLc = treeLc + 1 end
+    if UI.TreeScanLabel then
+        pcall(function() UI.TreeScanLabel:Set("Tree: " .. treeLc .. " lines  (via Full Scan)") end)
+    end
+    if UI.TreeParagraph then
+        pcall(function()
+            UI.TreeParagraph:Set({
+                Title   = "Hierarchy Output  (" .. treeLc .. " lines)",
+                Content = truncate(treeResult, C.MAX_PARA_TREE),
+            })
+        end)
+    end
+
+    parts[#parts + 1] = "[SECTION 1: HIERARCHY TREE]"
+    parts[#parts + 1] = DIV
+    parts[#parts + 1] = treeResult
+    parts[#parts + 1] = ""
+
+    -- ---- STEP 2: REMOTES ----
+    setFull("Step 2/3: Enumerating remotes...")
+    task.wait()
+
+    local ok2, remErr = pcall(function()
+        ST.remoteList = buildRemoteList()
+    end)
+
+    if not ok2 then
+        parts[#parts + 1] = "[SECTION 2: REMOTES]"
+        parts[#parts + 1] = DIV
+        parts[#parts + 1] = "[REMOTES ERROR]: " .. tostring(remErr)
+        parts[#parts + 1] = ""
+    else
+        -- Side-effect: update Remotes tab
+        rebuildRemoteDropdown(ST.remoteFilter)
+        if UI.RemoteScanLabel then
+            pcall(function() UI.RemoteScanLabel:Set("Remotes found: " .. #ST.remoteList .. "  (via Full Scan)") end)
+        end
+
+        local remRows = {}
+        remRows[#remRows + 1] = "[SECTION 2: REMOTES]"
+        remRows[#remRows + 1] = DIV
+        remRows[#remRows + 1] = tostring(#ST.remoteList) .. " remotes found"
+        remRows[#remRows + 1] = ""
+        for _, r in ipairs(ST.remoteList) do
+            remRows[#remRows + 1] = r.path .. "  [" .. r.cls .. "]"
+        end
+        parts[#parts + 1] = table.concat(remRows, "\n")
+        parts[#parts + 1] = ""
+    end
+
+    -- ---- STEP 3: SCRIPTS ----
+    setFull("Step 3/3: Enumerating scripts...")
+    task.wait()
+
+    local ok3, scrErr = pcall(function()
+        ST.scriptList = buildScriptList()
+    end)
+
+    if not ok3 then
+        parts[#parts + 1] = "[SECTION 3: SCRIPTS]"
+        parts[#parts + 1] = DIV
+        parts[#parts + 1] = "[SCRIPTS ERROR]: " .. tostring(scrErr)
+        parts[#parts + 1] = ""
+    else
+        -- Side-effect: update Scripts tab
+        rebuildScriptDropdown(ST.scriptFilter)
+        if UI.ScriptScanLabel then
+            pcall(function() UI.ScriptScanLabel:Set("Scripts found: " .. #ST.scriptList .. "  (via Full Scan)") end)
+        end
+
+        local scrRows = {}
+        scrRows[#scrRows + 1] = "[SECTION 3: SCRIPTS]"
+        scrRows[#scrRows + 1] = DIV
+        scrRows[#scrRows + 1] = tostring(#ST.scriptList) .. " scripts found"
+
+        if ST.fullScanIncludeSources then
+            scrRows[#scrRows + 1] = "(decompiled sources included)"
+            scrRows[#scrRows + 1] = ""
+            -- Snapshot the list so mutations mid-loop don't affect iteration
+            local snapshot = {}
+            for i, v in ipairs(ST.scriptList) do snapshot[i] = v end
+
+            for i, item in ipairs(snapshot) do
+                setFull("Step 3/3: Decompiling " .. i .. "/" .. #snapshot .. "  —  " .. item.name)
+                task.wait()
+                local src, lineCount, method = decompileScript(item)
+                scrRows[#scrRows + 1] = string.rep("=", 60)
+                scrRows[#scrRows + 1] = "-- [" .. i .. "]  " .. item.path
+                scrRows[#scrRows + 1] = "-- Class:  " .. item.cls
+                scrRows[#scrRows + 1] = "-- Lines:  " .. lineCount .. "  |  Method: " .. method
+                scrRows[#scrRows + 1] = string.rep("=", 60)
+                scrRows[#scrRows + 1] = src
+                scrRows[#scrRows + 1] = ""
+            end
+        else
+            scrRows[#scrRows + 1] = "(sources excluded — enable 'Include Script Sources' toggle to include)"
+            scrRows[#scrRows + 1] = ""
+            for _, item in ipairs(ST.scriptList) do
+                scrRows[#scrRows + 1] = item.path .. "  [" .. item.cls .. "]"
+            end
+        end
+
+        parts[#parts + 1] = table.concat(scrRows, "\n")
+        parts[#parts + 1] = ""
+    end
+
+    -- ---- FOOTER ----
+    -- Concatenate body first so footer can reference the true char count.
+    local body = table.concat(parts, "\n")
+    local footer = "\n" .. SEP
+        .. "\nEND OF FULL SCAN  --  " .. #body .. " chars total"
+        .. "\n" .. SEP
+    ST.fullScanText = body .. footer
+
+    local totalChars = #ST.fullScanText
+    local doneMsg = "Full scan complete — " .. totalChars .. " chars"
+    setStatus(doneMsg)
+    if UI.FullScanLabel then
+        pcall(function() UI.FullScanLabel:Set(doneMsg) end)
+    end
+    if UI.FullScanParagraph then
+        pcall(function()
+            UI.FullScanParagraph:Set({
+                Title   = "Full Scan Output  (" .. totalChars .. " chars)",
+                Content = truncate(ST.fullScanText, C.MAX_PARA_TREE),
+            })
+        end)
+    end
+
+    notify("Full Scan Complete", doneMsg, "check-circle", 5)
+    ST.scanning = false
+end
+
 -- ============================================================
 -- S12  REMOTE SPY
 -- N3: origNamecall pre-captured via rawget BEFORE hookmetamethod.
@@ -1520,7 +1715,53 @@ local _MAIN_OK, _MAIN_ERR = pcall(function()
     })
 
     -- --------------------------------------------------------
-    -- TAB 5: INFO
+    -- TAB 5: FULL SCAN
+    -- --------------------------------------------------------
+    local FullScanTab = UI.Window:CreateTab("Full Scan", "scan-line")
+
+    FullScanTab:CreateSection("Options")
+    UI.FullScanToggle = FullScanTab:CreateToggle({
+        Name         = "Include Script Sources",
+        CurrentValue = true,
+        Flag         = "FullScanSourceToggle",
+        Callback     = function(value)
+            ST.fullScanIncludeSources = value
+        end,
+    })
+
+    FullScanTab:CreateSection("Scan")
+    UI.FullScanLabel = FullScanTab:CreateLabel("Status: Ready")
+    FullScanTab:CreateButton({
+        Name     = "Run Full Scan",
+        Callback = function() task.spawn(doFullScan) end,
+    })
+
+    FullScanTab:CreateSection("Preview")
+    UI.FullScanParagraph = FullScanTab:CreateParagraph({
+        Title   = "Full Scan Output",
+        Content = "Run Full Scan to combine Tree, Remotes, and Scripts into one document.",
+    })
+
+    FullScanTab:CreateSection("Export")
+    FullScanTab:CreateButton({
+        Name     = "Copy Full Scan Output",
+        Callback = function()
+            local text = ST.fullScanText or ""
+            if text == "" then
+                notify("Nothing to Copy", "Run Full Scan first.", "alert-circle", 3)
+                return
+            end
+            local ok, err = pcall(setclipboard, text)
+            if ok then
+                notify("Copied", #text .. " chars copied to clipboard.", "clipboard-check", 4)
+            else
+                notify("Copy Error", tostring(err), "alert-circle", 4)
+            end
+        end,
+    })
+
+    -- --------------------------------------------------------
+    -- TAB 6: INFO
     -- --------------------------------------------------------
     local InfoTab = UI.Window:CreateTab("Info", "info")
 
@@ -1537,7 +1778,8 @@ local _MAIN_OK, _MAIN_ERR = pcall(function()
             .. "  Tree       —  Full DataModel hierarchy scan\n"
             .. "  Scripts    —  Enumerate + decompile all scripts\n"
             .. "  Remotes    —  Enumerate remotes + live spy\n"
-            .. "  Properties —  Inspect any instance by path\n\n"
+            .. "  Properties —  Inspect any instance by path\n"
+            .. "  Full Scan  —  Tree + Remotes + Scripts in one output\n\n"
             .. "LOAD VIA BOOTSTRAP.LUA\n"
             .. "Do not use loadstring(game:HttpGet(...))() directly.\n"
             .. "The bootstrap uses http_request to bypass __namecall\n"
