@@ -1751,9 +1751,38 @@ local _MAIN_OK, _MAIN_ERR = pcall(function()
                 notify("Nothing to Copy", "Run Full Scan first.", "alert-circle", 3)
                 return
             end
-            local ok, err = pcall(setclipboard, text)
+
+            -- setclipboard has an undocumented size ceiling on Xeno.
+            -- When the string exceeds it the call silently no-ops — no error,
+            -- no clipboard write. Cap at 900 000 chars (well inside the safe
+            -- zone for all known executor builds). If the full output is larger
+            -- we copy the leading chunk and tell the user clearly.
+            local CLIPBOARD_CAP = 900000
+            local payload, truncated
+            if #text > CLIPBOARD_CAP then
+                payload   = text:sub(1, CLIPBOARD_CAP)
+                truncated = true
+            else
+                payload   = text
+                truncated = false
+            end
+
+            -- Upvalue closure rather than pcall(setclipboard, payload):
+            -- avoids the pcall vararg relay into a C function, which drops
+            -- large strings silently on some executor builds.
+            local ok, err = pcall(function() setclipboard(payload) end)
             if ok then
-                notify("Copied", #text .. " chars copied to clipboard.", "clipboard-check", 4)
+                if truncated then
+                    notify(
+                        "Partial Copy",
+                        CLIPBOARD_CAP .. " of " .. #text
+                            .. " chars copied.\nDisable 'Include Script Sources' for a smaller output.",
+                        "clipboard",
+                        6
+                    )
+                else
+                    notify("Copied", #payload .. " chars copied to clipboard.", "clipboard-check", 4)
+                end
             else
                 notify("Copy Error", tostring(err), "alert-circle", 4)
             end
