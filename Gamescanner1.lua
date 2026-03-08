@@ -1,52 +1,58 @@
--- XenoScanner v4.1 -- Production -- Pure ASCII -- Safe re-execute
--- Tabs: TREE | SCRIPTS | REMOTES | PROPS
--- Keybind: RightShift = toggle GUI
---
--- v4.1: All 16 architectural review findings resolved.
---
--- Fixes applied:
---   HK-001: stopSpy performs actual hook identity verification before restore
---   HK-002: ST.spyHookRef stores actual closure reference (not boolean)
---   HK-003: Spy render thread uses generation counter (no task.cancel dependency)
---   HK-004: All connections tracked via track() registry for full cleanup
---   HK-005: Spy button greyed/disabled when hookmetamethod is unavailable
---   SM-001: applyFilter blocked during active scans (filterPending queue)
---   SM-002: Per-tab selected state cleared before pcall in scan bodies
---   SM-003: REMOTES tab separates spy view from remote detail view
---   SM-004: Filter application deferred during scans, applied in releaseScan
---   SM-005: Bulk copy acquires scanning mutex
---   CL-001: GUI_PARENT tested with ScreenGui instance + IsDescendantOf
---   CL-002: resolvePath restricts GetService to C.ROOTS whitelist
---   CL-003: decompileScript validates instance existence before attempt
---   CL-004: Spy activation blocked when newcclosure is shimmed
---   CL-005: destroyOld uses recursive GetDescendants search
---   CL-006: chunkStr includes safety iteration cap
---
--- Original v4.0 fixes (H-001 through H-015) preserved and improved.
+-- XenoScanner v4.2  --  Rayfield Edition  --  Production  --  Safe re-execute
+-- Tabs: TREE | SCRIPTS | REMOTES | PROPERTIES | INFO
+-- Keybind: RightShift = toggle GUI  (Rayfield native)
+-- Load via Bootstrap.lua -- do NOT use raw loadstring(game:HttpGet(...))()
+-- ============================================================
+-- CHANGELOG
+-- v4.2 Rayfield: Full Rayfield GUI rewrite. All v4.2 backend fixes preserved.
+--   N2: S0.5 early __namecall hook recovery (_G persistence)
+--   N3: startSpy uses rawget pre-capture -- timing race structurally impossible
+--   N4: stopSpy clears _G key on clean stop
+--   N5: top-level pcall for real init error messages
+--   Luau fix: local args = {...} before nested pcall in spy hook
+-- ============================================================
 
 -- ============================================================
 -- S0  UNC SHIMS
--- Every exploit API shimmed before anything else runs.
 -- ============================================================
-if not cloneref          then cloneref          = function(o) return o   end end
-if not getnilinstances   then getnilinstances   = function()  return {}  end end
-if not getinstances      then getinstances      = function()  return {}  end end
-if not getscripts        then getscripts        = function()  return {}  end end
-if not decompile         then decompile         = function()  return nil end end
-if not getscriptclosure  then getscriptclosure  = function()  return nil end end
-if not getconstants      then getconstants      = function()  return {}  end end
-if not getupvalues       then getupvalues       = function()  return {}  end end
-if not getgc             then getgc             = function()  return {}  end end
-if not checkcaller       then checkcaller       = function()  return false end end
-if not newcclosure       then newcclosure       = function(f) return f   end end
-if not getnamecallmethod then getnamecallmethod = function()  return ""  end end
-if not gethui            then gethui            = function()  return nil end end
+if not cloneref          then cloneref          = function(o)  return o    end end
+if not getnilinstances   then getnilinstances   = function()   return {}   end end
+if not getinstances      then getinstances      = function()   return {}   end end
+if not getscripts        then getscripts        = function()   return {}   end end
+if not decompile         then decompile         = function()   return nil  end end
+if not getscriptclosure  then getscriptclosure  = function()   return nil  end end
+if not getconstants      then getconstants      = function()   return {}   end end
+if not getupvalues       then getupvalues       = function()   return {}   end end
+if not getgc             then getgc             = function()   return {}   end end
+if not checkcaller       then checkcaller       = function()   return false end end
+if not newcclosure       then newcclosure       = function(f)  return f    end end
+if not getnamecallmethod then getnamecallmethod = function()   return ""   end end
+if not gethui            then gethui            = function()   return nil  end end
 if not hookmetamethod    then hookmetamethod    = nil end
-if not task.cancel       then task.cancel       = function() end end
-if not getrawmetatable   then getrawmetatable   = function() return {} end end
-if not setclipboard      then
+if not task.cancel       then task.cancel       = function()               end end
+if not getrawmetatable   then
+    getrawmetatable = function(o) return getmetatable(o) end
+end
+if not setclipboard then
     setclipboard = function()
         error("[XenoScanner] setclipboard not available on this executor")
+    end
+end
+
+-- ============================================================
+-- S0.5  EARLY HOOK RECOVERY
+-- Runs before ANY game namecall (before even game:GetService).
+-- hookmetamethod is a direct executor C-call -- safe even when
+-- __namecall is broken. If a prior session crashed mid-spy,
+-- _G.__XenoScannerNamecallOrig holds the original __namecall.
+-- Restore it here before anything else touches the metatable.
+-- ============================================================
+do
+    local stored = _G.__XenoScannerNamecallOrig
+    if stored ~= nil and hookmetamethod then
+        pcall(hookmetamethod, game, "__namecall", stored)
+        _G.__XenoScannerNamecallOrig = nil
+        print("[XenoScanner v4.2] Restored __namecall from crashed prior session.")
     end
 end
 
@@ -59,39 +65,28 @@ local CoreGui = cloneref(game:GetService("CoreGui"))
 local LP      = Players.LocalPlayer
 
 -- ============================================================
--- S1.5  CONNECTION REGISTRY  [FIX HK-004]
--- All connections pass through track() for guaranteed cleanup.
--- Replaces the incomplete _connections pattern from v4.0 that
--- only tracked 2 out of ~20+ connections.
+-- S1.5  CONNECTION REGISTRY
+-- UIS connections tracked for cleanup on script close.
 -- ============================================================
 local _connections = {}
-
 local function track(conn)
     _connections[#_connections + 1] = conn
     return conn
 end
-
 local function disconnectAll()
-    for _, c in ipairs(_connections) do
-        pcall(function() c:Disconnect() end)
-    end
+    for _, c in ipairs(_connections) do pcall(function() c:Disconnect() end) end
     _connections = {}
 end
 
 -- ============================================================
--- S2  GUI PARENT
--- [FIX CL-001] Tests with ScreenGui instance + IsDescendantOf.
--- v4.0 tested with a Frame (wrong type) and used reference
--- equality (fails with cloneref). Fixed both issues.
+-- S2  GUI PARENT  (needed by destroyOld)
 -- ============================================================
 local GUI_PARENT
 do
     local ok = pcall(function()
-        local t = Instance.new("ScreenGui") -- [CL-001] Test the actual type
+        local t = Instance.new("ScreenGui")
         t.Parent = CoreGui
-        -- [CL-001] IsDescendantOf handles cloneref reference inequality
-        assert(t.Parent ~= nil and t:IsDescendantOf(CoreGui),
-            "ScreenGui parent assignment rejected")
+        assert(t:IsDescendantOf(CoreGui), "rejected")
         t:Destroy()
     end)
     if ok then
@@ -108,20 +103,15 @@ end
 
 -- ============================================================
 -- S3  CLEANUP
--- [FIX CL-005] Recursive search via GetDescendants for zombie GUIs.
--- v4.0 used FindFirstChild (direct children only) which missed
--- reparented or nested GUI instances from prior executions.
--- [FIX HK-004] Disconnects all tracked connections from prior run.
+-- Destroys prior XenoScanner and Rayfield GUIs from all parents.
+-- Also disconnects prior execution's tracked connections from _G.
 -- ============================================================
 local SCRIPT_NAME = "XenoScannerV4"
 
 local function destroyOld()
-    -- Disconnect prior execution's tracked connections from _G
     local oldConns = _G[SCRIPT_NAME .. "_conns"]
     if type(oldConns) == "table" then
-        for _, c in ipairs(oldConns) do
-            pcall(function() c:Disconnect() end)
-        end
+        for _, c in ipairs(oldConns) do pcall(function() c:Disconnect() end) end
     end
 
     local parents = { CoreGui }
@@ -132,21 +122,22 @@ local function destroyOld()
         parents[#parents + 1] = hui
     end
 
-    -- [CL-005] Recursive search catches reparented/nested zombie GUIs
     for _, p in ipairs(parents) do
+        -- Destroy prior XenoScanner ScreenGui
         local ok, desc = pcall(function() return p:GetDescendants() end)
         if ok and type(desc) == "table" then
             for _, inst in ipairs(desc) do
                 local okN, n = pcall(function() return inst.Name end)
                 local okC, c = pcall(function() return inst.ClassName end)
-                -- [CL-005] Pattern match instead of exact equality for version safety
-                if okN and okC and c == "ScreenGui"
-                    and type(n) == "string"
+                if okN and okC and c == "ScreenGui" and type(n) == "string"
                     and n:find("XenoScanner", 1, true) then
                     pcall(function() inst:Destroy() end)
                 end
             end
         end
+        -- Destroy prior Rayfield ScreenGui
+        local rayfieldGui = p:FindFirstChild("Rayfield")
+        if rayfieldGui then pcall(function() rayfieldGui:Destroy() end) end
     end
 end
 destroyOld()
@@ -161,62 +152,76 @@ local C = {
         "ServerStorage", "StarterGui", "StarterPack", "StarterPlayer",
         "Teams", "SoundService", "TextChatService", "CoreGui",
     },
-    SKIP      = { Terrain = true },
-    MAX_DEPTH = 64,
-    CHUNK     = 175000,
-    W = 740, H = 520,
-    BG      = Color3.fromRGB( 12,  12,  18),
-    SURFACE = Color3.fromRGB( 20,  20,  30),
-    HEADER  = Color3.fromRGB( 18,  18,  28),
-    ACCENT  = Color3.fromRGB(108,  92, 231),
-    ACCENT2 = Color3.fromRGB( 72, 200, 150),
-    DANGER  = Color3.fromRGB(210,  60,  60),
-    TEXT    = Color3.fromRGB(225, 225, 240),
-    DIM     = Color3.fromRGB(120, 120, 150),
-    CODEBG  = Color3.fromRGB(  8,   8,  14),
-    SPY_COL = Color3.fromRGB(220, 160,  40),
-    GREEN   = Color3.fromRGB( 40, 180, 100),
-    GREY    = Color3.fromRGB( 80,  80, 110),
-    WARN_COL = Color3.fromRGB(200, 100,  40),
-    FILTER_DEBOUNCE = 0.15,
-    SPY_POLL_RATE   = 0.25,
+    SKIP         = { Terrain = true },
+    MAX_DEPTH    = 64,
+    CHUNK        = 175000,
+    SPY_POLL_RATE = 0.25,
+    MAX_PARA_TREE   = 3500,
+    MAX_PARA_SOURCE = 4500,
+    MAX_SPY_LINES   = 80,
 }
 
--- [CL-002] Whitelist set built from ROOTS for fast lookup in resolvePath
 local ROOTS_SET = {}
 for _, name in ipairs(C.ROOTS) do ROOTS_SET[name] = true end
 
 -- ============================================================
--- S5  STATE
--- [SM-003] Added remotesView for spy/detail separation
--- [HK-003] Added spyGen for generation-counter thread management
--- [SM-001/SM-004] Added filterPending for deferred filter application
+-- S5  STATE + UI ELEMENT REFERENCES
+-- UI table holds all live Rayfield element references so scan
+-- actions and the spy thread can update them after creation.
 -- ============================================================
 local ST = {
-    activeTab      = "TREE",
-    guiVisible     = true,
     scanning       = false,
+    -- Per-tab filter/path state
+    treeFilter     = "",
+    scriptFilter   = "",
+    remoteFilter   = "",
+    propsPath      = "",
+    -- Data caches
+    treeText            = nil,
+    scriptList          = {},
+    remoteList          = {},
+    selectedScriptSource = nil,
+    selectedRemotePath   = nil,
+    propsText           = nil,
     -- Spy state
     spyActive      = false,
     spyOriginal    = nil,
-    spyHookRef     = nil,       -- [HK-002] Stores actual closure reference
+    spyHookRef     = nil,
     spyLines       = {},
     spyRenderThread = nil,
     spyDirty       = false,
-    spyGen         = 0,         -- [HK-003] Generation counter for spy threads
-    -- Data caches
-    treeText       = nil,
-    scriptList     = {},
-    remoteList     = {},
-    -- Per-tab selected state
-    selectedScriptSource = nil,
-    selectedRemotePath   = nil,
-    propsText      = nil,
-    filterText     = "",
-    filterGen      = 0,
-    filterPending  = false,     -- [SM-001/SM-004] Deferred filter flag
-    -- [SM-003] Remotes tab view mode: "detail" or "spy"
-    remotesView    = "detail",
+    spyGen         = 0,
+    -- Dropdown rebuild counter (unique flags when config saving is off)
+    dropdownGen    = 0,
+}
+
+-- Rayfield element references -- populated during window construction
+local UI = {
+    -- TREE tab
+    TreeScanLabel    = nil,
+    TreeParagraph    = nil,
+    -- SCRIPTS tab
+    ScriptsTab       = nil,   -- tab ref needed for dynamic dropdown creation
+    ScriptScanLabel  = nil,
+    ScriptDropdown   = nil,
+    ScriptParagraph  = nil,
+    -- REMOTES tab
+    RemotesTab       = nil,
+    RemoteScanLabel  = nil,
+    RemoteDropdown   = nil,
+    RemoteParagraph  = nil,
+    SpyToggle        = nil,
+    SpyCountLabel    = nil,
+    SpyParagraph     = nil,
+    -- PROPERTIES tab
+    PropsLabel       = nil,
+    PropsParagraph   = nil,
+    PropsInput       = nil,
+    -- INFO tab
+    StatusLabel      = nil,
+    InfoParagraph    = nil,
+    -- Rayfield root
+    Window           = nil,
 }
 
 -- ============================================================
@@ -226,26 +231,6 @@ local ST = {
 local function SP(inst, prop)
     local ok, v = pcall(function() return inst[prop] end)
     return ok and tostring(v) or "<?>"
-end
-
--- [CL-006] chunkStr with safety iteration cap
-local function chunkStr(str)
-    local out, s, len = {}, 1, #str
-    local maxIter = math.ceil(len / C.CHUNK) + 2
-    local iter = 0
-    while s <= len do
-        iter = iter + 1
-        if iter > maxIter then break end -- [CL-006] Safety cap
-        local e = math.min(s + C.CHUNK - 1, len)
-        if e < len then
-            for i = e, s, -1 do
-                if str:sub(i, i) == "\n" then e = i; break end
-            end
-        end
-        out[#out + 1] = str:sub(s, e)
-        s = e + 1
-    end
-    return out
 end
 
 local function fullPath(inst)
@@ -272,12 +257,10 @@ local function numberLines(src)
     return table.concat(out, "\n"), n
 end
 
--- [CL-003] Instance validity check utility
 local function isInstanceAlive(inst)
     local ok, parent = pcall(function() return inst.Parent end)
     if not ok then return false end
     if parent == nil then
-        -- Check if it's intentionally nil-parented (e.g. in nil instances)
         local okN, nilInsts = pcall(getnilinstances)
         if okN and type(nilInsts) == "table" then
             for _, ni in ipairs(nilInsts) do
@@ -289,16 +272,46 @@ local function isInstanceAlive(inst)
     return true
 end
 
+-- Truncates text for Paragraph display, appending a note if cut.
+local function truncate(text, limit)
+    if not text or #text == 0 then return "(empty)" end
+    if #text <= limit then return text end
+    return text:sub(1, limit)
+        .. "\n\n... ["
+        .. tostring(#text)
+        .. " chars total — use Copy button for full output]"
+end
+
+-- Fires a Rayfield notification AND updates the INFO tab status label.
+local function setStatus(msg)
+    msg = tostring(msg)
+    if UI.StatusLabel then
+        pcall(function() UI.StatusLabel:Set(msg) end)
+    end
+end
+
+local function notify(title, content, icon, duration)
+    if UI.Window then
+        pcall(function()
+            UI.Window:Notify({
+                Title    = title or "XenoScanner",
+                Content  = content or "",
+                Duration = duration or 4,
+                Image    = icon or "info",
+            })
+        end)
+    end
+end
+
 -- ============================================================
--- S7  SCANNERS
+-- S7  SCANNERS  (logic unchanged from v4.1 — only display changed)
 -- ============================================================
 
--- S7-A  TREE ------------------------------------------------
+-- S7-A  TREE
 local function buildTree()
     local lines = {}
     local function ins(s) lines[#lines + 1] = s end
-
-    ins("XENO GAME SCANNER v4.1  --  Full Hierarchy")
+    ins("XENO GAME SCANNER v4.2  --  Full Hierarchy")
     ins("Game:    " .. SP(game, "Name"))
     ins("PlaceId: " .. SP(game, "PlaceId"))
     ins("JobId:   " .. SP(game, "JobId"))
@@ -307,21 +320,18 @@ local function buildTree()
 
     local function recurse(inst, prefix, isLast, depth)
         if depth > C.MAX_DEPTH then
-            lines[#lines + 1] = prefix
-                .. (isLast and "\\- " or "|- ") .. "[MAX DEPTH]"
+            lines[#lines + 1] = prefix .. (isLast and "\\- " or "|- ") .. "[MAX DEPTH]"
             return
         end
         local br   = isLast and "\\- " or "|- "
         local name = SP(inst, "Name")
         local cls  = SP(inst, "ClassName")
         lines[#lines + 1] = prefix .. br .. name .. "  [" .. cls .. "]"
-
         if C.SKIP[cls] then
             local cp = prefix .. (isLast and "   " or "|  ")
             lines[#lines + 1] = cp .. "\\- ... (skipped)"
             return
         end
-
         local ok, ch = pcall(function() return inst:GetChildren() end)
         if not ok or type(ch) ~= "table" or #ch == 0 then return end
         local cp = prefix .. (isLast and "   " or "|  ")
@@ -335,47 +345,37 @@ local function buildTree()
         if ok and svc then
             local ok2, ch = pcall(function() return svc:GetChildren() end)
             local count = (ok2 and type(ch) == "table") and #ch or 0
-            ins(">> " .. svcName
-                .. "  [" .. SP(svc, "ClassName") .. "]"
-                .. "  (" .. count .. " children)")
+            ins(">> " .. svcName .. "  [" .. SP(svc, "ClassName") .. "]  (" .. count .. " children)")
             if ok2 and type(ch) == "table" then
-                for i = 1, #ch do
-                    pcall(recurse, ch[i], "  ", i == #ch, 1)
-                end
+                for i = 1, #ch do pcall(recurse, ch[i], "  ", i == #ch, 1) end
             end
             ins("")
         end
     end
-
     ins(string.rep("-", 60))
     ins("Scan complete  --  " .. #lines .. " lines")
     return table.concat(lines, "\n")
 end
 
--- S7-B  SCRIPTS ---------------------------------------------
+-- S7-B  SCRIPTS
 local function buildScriptList()
     local list, seen = {}, {}
-
     local ok, scripts = pcall(getscripts)
     if ok and type(scripts) == "table" then
         for _, s in ipairs(scripts) do
             if not seen[s] then
                 seen[s] = true
                 local ok2, cls  = pcall(function() return s.ClassName end)
-                local ok3, name = pcall(function() return s.Name      end)
-                if ok2 and (cls == "LocalScript" or cls == "Script"
-                            or cls == "ModuleScript") then
+                local ok3, name = pcall(function() return s.Name end)
+                if ok2 and (cls == "LocalScript" or cls == "Script" or cls == "ModuleScript") then
                     list[#list + 1] = {
-                        name     = ok3 and tostring(name) or "<?>",
-                        cls      = cls,
-                        path     = fullPath(s),
-                        instance = s,
+                        name = ok3 and tostring(name) or "<?>",
+                        cls  = cls, path = fullPath(s), instance = s,
                     }
                 end
             end
         end
     end
-
     if #list == 0 then
         local ok2, all = pcall(getinstances)
         if ok2 and type(all) == "table" then
@@ -383,51 +383,40 @@ local function buildScriptList()
                 if not seen[s] then
                     seen[s] = true
                     local ok3, cls = pcall(function() return s.ClassName end)
-                    if ok3 and (cls == "LocalScript" or cls == "Script"
-                                or cls == "ModuleScript") then
+                    if ok3 and (cls == "LocalScript" or cls == "Script" or cls == "ModuleScript") then
                         local ok4, name = pcall(function() return s.Name end)
                         list[#list + 1] = {
-                            name     = ok4 and tostring(name) or "<?>",
-                            cls      = cls,
-                            path     = fullPath(s),
-                            instance = s,
+                            name = ok4 and tostring(name) or "<?>",
+                            cls = cls, path = fullPath(s), instance = s,
                         }
                     end
                 end
             end
         end
     end
-
     table.sort(list, function(a, b) return a.path < b.path end)
     return list
 end
 
--- [CL-003] Validates instance before attempting decompilation
 local function decompileScript(entry)
     local inst = entry.instance
-
-    -- [CL-003] Check if the instance is still alive before decompiling
     if not isInstanceAlive(inst) then
-        local warning = "-- WARNING: Instance appears to have been destroyed since scan.\n"
-            .. "-- Path was: " .. entry.path .. "\n"
-            .. "-- Decompilation skipped."
-        local numbered, n = numberLines(warning)
+        local w = "-- WARNING: Instance appears destroyed since scan.\n-- Path was: "
+            .. entry.path .. "\n-- Decompilation skipped."
+        local numbered, n = numberLines(w)
         return numbered, n, "destroyed"
     end
-
     local ok1, src = pcall(decompile, inst)
     if ok1 and type(src) == "string" and #src > 0 then
         local numbered, n = numberLines(src)
         return numbered, n, "decompile()"
     end
-
     local ok2, closure = pcall(getscriptclosure, inst)
     if ok2 and closure then
-        local buf = {}
-        buf[#buf + 1] = "-- decompile() unavailable for this script."
-        buf[#buf + 1] = "-- Fallback: closure analysis"
-        buf[#buf + 1] = "--"
-        buf[#buf + 1] = "-- CONSTANTS:"
+        local buf = {
+            "-- decompile() unavailable for this script.",
+            "-- Fallback: closure analysis", "--", "-- CONSTANTS:",
+        }
         local ok3, consts = pcall(getconstants, closure)
         if ok3 and type(consts) == "table" then
             for i, v in ipairs(consts) do
@@ -441,8 +430,7 @@ local function decompileScript(entry)
         local ok4, ups = pcall(getupvalues, closure)
         if ok4 and type(ups) == "table" then
             for k, v in pairs(ups) do
-                buf[#buf + 1] = string.format(
-                    "--   [%s] = %s", tostring(k), tostring(v))
+                buf[#buf + 1] = string.format("--   [%s] = %s", tostring(k), tostring(v))
             end
         else
             buf[#buf + 1] = "--   (none)"
@@ -450,24 +438,19 @@ local function decompileScript(entry)
         local numbered, n = numberLines(table.concat(buf, "\n"))
         return numbered, n, "closure dump"
     end
-
-    local fallback = "-- Source unavailable.\n"
-        .. "-- Script is protected or obfuscated."
+    local fallback = "-- Source unavailable.\n-- Script is protected or obfuscated."
     local numbered, n = numberLines(fallback)
     return numbered, n, "unavailable"
 end
 
--- S7-C  REMOTES ---------------------------------------------
+-- S7-C  REMOTES
 local function buildRemoteList()
     local list, seen = {}, {}
     local TARGET = {
-        RemoteEvent            = true,
-        RemoteFunction         = true,
-        BindableEvent          = true,
-        BindableFunction       = true,
-        UnreliableRemoteEvent  = true,
+        RemoteEvent = true, RemoteFunction = true,
+        BindableEvent = true, BindableFunction = true,
+        UnreliableRemoteEvent = true,
     }
-
     local function scanRoot(root)
         if not root then return end
         local ok, desc = pcall(function() return root:GetDescendants() end)
@@ -479,21 +462,17 @@ local function buildRemoteList()
                 if ok2 and TARGET[cls] then
                     local ok3, name = pcall(function() return inst.Name end)
                     list[#list + 1] = {
-                        name     = ok3 and tostring(name) or "<?>",
-                        cls      = cls,
-                        path     = fullPath(inst),
-                        instance = inst,
+                        name = ok3 and tostring(name) or "<?>",
+                        cls  = cls, path = fullPath(inst), instance = inst,
                     }
                 end
             end
         end
     end
-
     for _, svcName in ipairs(C.ROOTS) do
         local ok, svc = pcall(function() return game:GetService(svcName) end)
         if ok and svc then scanRoot(svc) end
     end
-
     local okN, nilInsts = pcall(getnilinstances)
     if okN and type(nilInsts) == "table" then
         for _, inst in ipairs(nilInsts) do
@@ -503,753 +482,252 @@ local function buildRemoteList()
                 if ok2 and TARGET[cls] then
                     local ok3, name = pcall(function() return inst.Name end)
                     list[#list + 1] = {
-                        name     = ok3 and tostring(name) or "<?>",
-                        cls      = cls,
-                        path     = "(nil-parent) " .. (ok3 and tostring(name) or "<?>"),
+                        name = ok3 and tostring(name) or "<?>",
+                        cls  = cls,
+                        path = "(nil-parent) " .. (ok3 and tostring(name) or "<?>"),
                         instance = inst,
                     }
                 end
             end
         end
     end
-
     table.sort(list, function(a, b) return a.path < b.path end)
     return list
 end
 
--- S7-D  PROPERTIES ------------------------------------------
+-- S7-D  PROPERTIES
 local function buildPropsText(inst)
     if not inst then return "No instance selected." end
     local lines = {}
     local function ins(s) lines[#lines + 1] = s end
-
-    ins("PROPERTIES  --  " .. SP(inst, "Name")
-        .. "  [" .. SP(inst, "ClassName") .. "]")
+    ins("PROPERTIES  --  " .. SP(inst, "Name") .. "  [" .. SP(inst, "ClassName") .. "]")
     ins("Full path: " .. fullPath(inst))
     ins(string.rep("-", 56))
     ins("")
-
     local PROPS = {
-        "Name", "ClassName", "Parent", "Archivable", "Locked",
-        "Position", "Orientation", "Size", "CFrame",
-        "Color", "BrickColor", "Material", "Transparency",
-        "Anchored", "CanCollide", "CanQuery", "CastShadow",
-        "Massless", "RootPriority",
-        "Health", "MaxHealth", "WalkSpeed", "JumpPower",
-        "JumpHeight", "DisplayName",
-        "Disabled", "RunContext", "Source",
-        "Value",
-        "SoundId", "Volume", "PlayOnRemove", "IsPlaying", "Looped",
-        "Text", "TextColor3", "Font", "TextSize", "BackgroundColor3",
-        "Visible", "ZIndex",
-        "RespawnLocation", "Team", "TeamColor", "Neutral",
+        "Name","ClassName","Parent","Archivable","Locked",
+        "Position","Orientation","Size","CFrame",
+        "Color","BrickColor","Material","Transparency",
+        "Anchored","CanCollide","CanQuery","CastShadow","Massless","RootPriority",
+        "Health","MaxHealth","WalkSpeed","JumpPower","JumpHeight","DisplayName",
+        "Disabled","RunContext","Source","Value",
+        "SoundId","Volume","PlayOnRemove","IsPlaying","Looped",
+        "Text","TextColor3","Font","TextSize","BackgroundColor3","Visible","ZIndex",
+        "RespawnLocation","Team","TeamColor","Neutral",
     }
-
     for _, p in ipairs(PROPS) do
         local ok, v = pcall(function() return inst[p] end)
-        if ok then
-            ins(string.format("  %-28s = %s", p, tostring(v)))
-        end
+        if ok then ins(string.format("  %-28s = %s", p, tostring(v))) end
     end
-
     ins("")
     local okC, ch = pcall(function() return inst:GetChildren() end)
     local childCount = (okC and type(ch) == "table") and #ch or 0
     ins("CHILDREN  (" .. childCount .. ")")
     if okC and type(ch) == "table" then
         for _, child in ipairs(ch) do
-            ins("    " .. SP(child, "Name")
-                .. "  [" .. SP(child, "ClassName") .. "]")
+            ins("    " .. SP(child, "Name") .. "  [" .. SP(child, "ClassName") .. "]")
         end
     end
-
     return table.concat(lines, "\n")
 end
 
--- [CL-002] resolvePath with service whitelist from C.ROOTS
+-- S7-E  PATH RESOLVER
 local function resolvePath(pathStr)
     local f = pathStr:gsub("^%s+", ""):gsub("%s+$", "")
     if f == "" then return nil, "empty path" end
-
     local parts = {}
     for p in f:gmatch("[^%.]+") do parts[#parts + 1] = p end
-
     if parts[1] ~= "game" and parts[1] ~= "Game" then
         return nil, "path must start with 'game' (got '" .. parts[1] .. "')"
     end
-
     local cur = game
     for i = 2, #parts do
-        local seg  = parts[i]
+        local seg   = parts[i]
         local child = cur:FindFirstChild(seg)
         if child then
             cur = child
         elseif i == 2 then
-            -- [CL-002] Only resolve services that are in the whitelist
             if not ROOTS_SET[seg] then
-                return nil, "service '" .. seg
-                    .. "' is not in the scanner whitelist"
+                return nil, "service '" .. seg .. "' is not in the scanner whitelist"
             end
             local ok2, svc = pcall(function() return game:GetService(seg) end)
             if ok2 and svc and typeof(svc) == "Instance" then
                 cur = svc
             else
-                return nil, "could not find service or child '"
-                    .. seg .. "' under game"
+                return nil, "could not find service or child '" .. seg .. "' under game"
             end
         else
-            local parentName = parts[i - 1]
-            return nil, "could not find '" .. seg
-                .. "' under " .. parentName
+            return nil, "could not find '" .. seg .. "' under " .. parts[i - 1]
         end
     end
-
-    if typeof(cur) ~= "Instance" then
-        return nil, "resolved value is not an Instance"
-    end
+    if typeof(cur) ~= "Instance" then return nil, "resolved value is not an Instance" end
     return cur, nil
 end
 
 -- ============================================================
--- S8  GUI CONSTRUCTION
+-- RAYFIELD LOAD
+-- Runs after S0.5 has restored any broken hook, so game:HttpGet
+-- goes through a clean __namecall and will not crash.
 -- ============================================================
-
-local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name            = SCRIPT_NAME
-ScreenGui.ResetOnSpawn    = false
-ScreenGui.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
-ScreenGui.IgnoreGuiInset  = true
-ScreenGui.Parent          = GUI_PARENT
-
-local Main = Instance.new("Frame")
-Main.Name             = "Main"
-Main.Size             = UDim2.new(0, C.W, 0, C.H)
-Main.Position         = UDim2.new(0.5, -(C.W / 2), 0.5, -(C.H / 2))
-Main.BackgroundColor3 = C.BG
-Main.BorderSizePixel  = 0
-Main.ClipsDescendants = true
-Main.Parent           = ScreenGui
-Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 10)
-
-local TitleBar = Instance.new("Frame")
-TitleBar.Name             = "TitleBar"
-TitleBar.Size             = UDim2.new(1, 0, 0, 40)
-TitleBar.BackgroundColor3 = C.HEADER
-TitleBar.BorderSizePixel  = 0
-TitleBar.ZIndex           = 5
-TitleBar.Parent           = Main
-Instance.new("UICorner", TitleBar).CornerRadius = UDim.new(0, 10)
-
-local TBPatch = Instance.new("Frame")
-TBPatch.Size             = UDim2.new(1, 0, 0, 10)
-TBPatch.Position         = UDim2.new(0, 0, 1, -10)
-TBPatch.BackgroundColor3 = C.HEADER
-TBPatch.BorderSizePixel  = 0
-TBPatch.ZIndex           = 5
-TBPatch.Parent           = TitleBar
-
-local Stripe = Instance.new("Frame")
-Stripe.Size             = UDim2.new(0, 3, 0, 22)
-Stripe.Position         = UDim2.new(0, 10, 0.5, -11)
-Stripe.BackgroundColor3 = C.ACCENT
-Stripe.BorderSizePixel  = 0
-Stripe.ZIndex           = 6
-Stripe.Parent           = TitleBar
-Instance.new("UICorner", Stripe).CornerRadius = UDim.new(0, 2)
-
-local TitleLbl = Instance.new("TextLabel")
-TitleLbl.Text               = "XENO GAME SCANNER  v4.1"
-TitleLbl.Size               = UDim2.new(1, -100, 1, 0)
-TitleLbl.Position           = UDim2.new(0, 20, 0, 0)
-TitleLbl.BackgroundTransparency = 1
-TitleLbl.TextColor3         = C.TEXT
-TitleLbl.Font               = Enum.Font.GothamBold
-TitleLbl.TextSize           = 13
-TitleLbl.TextXAlignment     = Enum.TextXAlignment.Left
-TitleLbl.ZIndex             = 6
-TitleLbl.Parent             = TitleBar
-
-local function makeTitleBtn(xOff, col, lbl)
-    local b = Instance.new("TextButton")
-    b.Size             = UDim2.new(0, 26, 0, 26)
-    b.Position         = UDim2.new(1, xOff, 0.5, -13)
-    b.BackgroundColor3 = col
-    b.Text             = lbl
-    b.TextColor3       = Color3.new(1, 1, 1)
-    b.Font             = Enum.Font.GothamBold
-    b.TextSize         = 11
-    b.BorderSizePixel  = 0
-    b.ZIndex           = 7
-    b.Parent           = TitleBar
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
-    return b
-end
-
-local CloseBtn = makeTitleBtn(-34, C.DANGER,                    "X")
-local HideBtn  = makeTitleBtn(-64, Color3.fromRGB(80, 80, 100), "-")
-
-local TabBar = Instance.new("Frame")
-TabBar.Name             = "TabBar"
-TabBar.Size             = UDim2.new(1, 0, 0, 32)
-TabBar.Position         = UDim2.new(0, 0, 0, 40)
-TabBar.BackgroundColor3 = C.SURFACE
-TabBar.BorderSizePixel  = 0
-TabBar.ZIndex           = 4
-TabBar.Parent           = Main
-
-local TabLayout = Instance.new("UIListLayout")
-TabLayout.FillDirection     = Enum.FillDirection.Horizontal
-TabLayout.Padding           = UDim.new(0, 1)
-TabLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-TabLayout.Parent            = TabBar
-
-local UIPadTab = Instance.new("UIPadding")
-UIPadTab.PaddingLeft = UDim.new(0, 6)
-UIPadTab.Parent      = TabBar
-
-local TAB_NAMES  = { "TREE", "SCRIPTS", "REMOTES", "PROPS" }
-local tabButtons = {}
-
-for _, tname in ipairs(TAB_NAMES) do
-    local tb = Instance.new("TextButton")
-    tb.Name             = "Tab_" .. tname
-    tb.Size             = UDim2.new(0, 100, 1, -6)
-    tb.BackgroundColor3 = C.SURFACE
-    tb.Text             = tname
-    tb.TextColor3       = C.DIM
-    tb.Font             = Enum.Font.GothamBold
-    tb.TextSize         = 11
-    tb.BorderSizePixel  = 0
-    tb.ZIndex           = 5
-    tb.AutoButtonColor  = false
-    tb.Parent           = TabBar
-    Instance.new("UICorner", tb).CornerRadius = UDim.new(0, 5)
-    tabButtons[tname] = tb
-end
-
-local FilterBar = Instance.new("Frame")
-FilterBar.Name             = "FilterBar"
-FilterBar.Size             = UDim2.new(1, -16, 0, 26)
-FilterBar.Position         = UDim2.new(0, 8, 0, 76)
-FilterBar.BackgroundColor3 = C.SURFACE
-FilterBar.BorderSizePixel  = 0
-FilterBar.ZIndex           = 4
-FilterBar.Parent           = Main
-Instance.new("UICorner", FilterBar).CornerRadius = UDim.new(0, 5)
-
-local FilterLbl = Instance.new("TextLabel")
-FilterLbl.Text              = "Filter:"
-FilterLbl.Size              = UDim2.new(0, 40, 1, 0)
-FilterLbl.Position          = UDim2.new(0, 6, 0, 0)
-FilterLbl.BackgroundTransparency = 1
-FilterLbl.TextColor3        = C.DIM
-FilterLbl.Font              = Enum.Font.GothamBold
-FilterLbl.TextSize          = 11
-FilterLbl.ZIndex            = 5
-FilterLbl.Parent            = FilterBar
-
-local FilterInput = Instance.new("TextBox")
-FilterInput.Name              = "FilterInput"
-FilterInput.Size              = UDim2.new(1, -76, 1, 0)
-FilterInput.Position          = UDim2.new(0, 46, 0, 0)
-FilterInput.BackgroundTransparency = 1
-FilterInput.TextColor3        = C.TEXT
-FilterInput.PlaceholderText   = "type to filter..."
-FilterInput.PlaceholderColor3 = C.DIM
-FilterInput.Font              = Enum.Font.Code
-FilterInput.TextSize          = 11
-FilterInput.TextXAlignment    = Enum.TextXAlignment.Left
-FilterInput.ClearTextOnFocus  = false
-FilterInput.ZIndex            = 5
-FilterInput.Parent            = FilterBar
-
-local FilterClear = Instance.new("TextButton")
-FilterClear.Size             = UDim2.new(0, 28, 1, 0)
-FilterClear.Position         = UDim2.new(1, -30, 0, 0)
-FilterClear.BackgroundTransparency = 1
-FilterClear.Text             = "[X]"
-FilterClear.TextColor3       = C.DIM
-FilterClear.Font             = Enum.Font.GothamBold
-FilterClear.TextSize         = 10
-FilterClear.ZIndex           = 5
-FilterClear.Parent           = FilterBar
-
--- Content scroll (TREE + PROPS)
-local ContentScroll = Instance.new("ScrollingFrame")
-ContentScroll.Name                 = "ContentScroll"
-ContentScroll.Size                 = UDim2.new(1, -16, 1, -152)
-ContentScroll.Position             = UDim2.new(0, 8, 0, 108)
-ContentScroll.BackgroundColor3     = C.CODEBG
-ContentScroll.BorderSizePixel      = 0
-ContentScroll.ScrollBarThickness   = 5
-ContentScroll.ScrollBarImageColor3 = C.ACCENT
-ContentScroll.CanvasSize           = UDim2.new(0, 0, 0, 0)
-ContentScroll.AutomaticCanvasSize  = Enum.AutomaticSize.XY
-ContentScroll.ZIndex               = 3
-ContentScroll.Parent               = Main
-Instance.new("UICorner", ContentScroll).CornerRadius = UDim.new(0, 6)
-
-local ContentLayout = Instance.new("UIListLayout")
-ContentLayout.SortOrder = Enum.SortOrder.LayoutOrder
-ContentLayout.Padding   = UDim.new(0, 0)
-ContentLayout.Parent    = ContentScroll
-
-local ListPanel = Instance.new("Frame")
-ListPanel.Name             = "ListPanel"
-ListPanel.Size             = UDim2.new(0, 210, 1, -152)
-ListPanel.Position         = UDim2.new(0, 8, 0, 108)
-ListPanel.BackgroundColor3 = C.SURFACE
-ListPanel.BorderSizePixel  = 0
-ListPanel.ZIndex           = 3
-ListPanel.Visible          = false
-ListPanel.Parent           = Main
-Instance.new("UICorner", ListPanel).CornerRadius = UDim.new(0, 6)
-
-local ListScroll = Instance.new("ScrollingFrame")
-ListScroll.Size                 = UDim2.new(1, -4, 1, -4)
-ListScroll.Position             = UDim2.new(0, 2, 0, 2)
-ListScroll.BackgroundTransparency = 1
-ListScroll.BorderSizePixel      = 0
-ListScroll.ScrollBarThickness   = 4
-ListScroll.ScrollBarImageColor3 = C.ACCENT
-ListScroll.CanvasSize           = UDim2.new(0, 0, 0, 0)
-ListScroll.AutomaticCanvasSize  = Enum.AutomaticSize.Y
-ListScroll.ZIndex               = 4
-ListScroll.Parent               = ListPanel
-
-local ListItemLayout = Instance.new("UIListLayout")
-ListItemLayout.SortOrder = Enum.SortOrder.LayoutOrder
-ListItemLayout.Padding   = UDim.new(0, 2)
-ListItemLayout.Parent    = ListScroll
-
-local UIPadList = Instance.new("UIPadding")
-UIPadList.PaddingLeft   = UDim.new(0, 4)
-UIPadList.PaddingTop    = UDim.new(0, 4)
-UIPadList.PaddingRight  = UDim.new(0, 4)
-UIPadList.Parent        = ListScroll
-
-local SourceScroll = Instance.new("ScrollingFrame")
-SourceScroll.Name                 = "SourceScroll"
-SourceScroll.Size                 = UDim2.new(1, -230, 1, -152)
-SourceScroll.Position             = UDim2.new(0, 224, 0, 108)
-SourceScroll.BackgroundColor3     = C.CODEBG
-SourceScroll.BorderSizePixel      = 0
-SourceScroll.ScrollBarThickness   = 5
-SourceScroll.ScrollBarImageColor3 = C.ACCENT2
-SourceScroll.CanvasSize           = UDim2.new(0, 0, 0, 0)
-SourceScroll.AutomaticCanvasSize  = Enum.AutomaticSize.XY
-SourceScroll.ZIndex               = 3
-SourceScroll.Visible              = false
-SourceScroll.Parent               = Main
-Instance.new("UICorner", SourceScroll).CornerRadius = UDim.new(0, 6)
-
-local SourceLayout = Instance.new("UIListLayout")
-SourceLayout.SortOrder = Enum.SortOrder.LayoutOrder
-SourceLayout.Padding   = UDim.new(0, 0)
-SourceLayout.Parent    = SourceScroll
-
-local StatusBar = Instance.new("Frame")
-StatusBar.Name             = "StatusBar"
-StatusBar.Size             = UDim2.new(1, 0, 0, 22)
-StatusBar.Position         = UDim2.new(0, 0, 1, -44)
-StatusBar.BackgroundColor3 = C.SURFACE
-StatusBar.BorderSizePixel  = 0
-StatusBar.ZIndex           = 4
-StatusBar.Parent           = Main
-
-local StatusLbl = Instance.new("TextLabel")
-StatusLbl.Size             = UDim2.new(1, -12, 1, 0)
-StatusLbl.Position         = UDim2.new(0, 10, 0, 0)
-StatusLbl.BackgroundTransparency = 1
-StatusLbl.TextColor3       = C.DIM
-StatusLbl.Font             = Enum.Font.Code
-StatusLbl.TextSize         = 10
-StatusLbl.TextXAlignment   = Enum.TextXAlignment.Left
-StatusLbl.Text             = "Ready."
-StatusLbl.ZIndex           = 5
-StatusLbl.Parent           = StatusBar
-
-local BtnRow = Instance.new("Frame")
-BtnRow.Name             = "BtnRow"
-BtnRow.Size             = UDim2.new(1, -16, 0, 34)
-BtnRow.Position         = UDim2.new(0, 8, 1, -40)
-BtnRow.BackgroundTransparency = 1
-BtnRow.ZIndex           = 4
-BtnRow.Parent           = Main
-
-local BtnRowLayout = Instance.new("UIListLayout")
-BtnRowLayout.FillDirection     = Enum.FillDirection.Horizontal
-BtnRowLayout.Padding           = UDim.new(0, 6)
-BtnRowLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-BtnRowLayout.Parent            = BtnRow
-
-local function makeBtn(label, col, w)
-    local b = Instance.new("TextButton")
-    b.Size             = UDim2.new(0, w or 120, 1, 0)
-    b.BackgroundColor3 = col
-    b.Text             = label
-    b.TextColor3       = Color3.new(1, 1, 1)
-    b.Font             = Enum.Font.GothamBold
-    b.TextSize         = 11
-    b.BorderSizePixel  = 0
-    b.ZIndex           = 5
-    b.AutoButtonColor  = true
-    b.Parent           = BtnRow
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
-    return b
-end
-
-local BtnScan      = makeBtn("[ SCAN ]",       C.GREEN,     90)
-local BtnCopyMain  = makeBtn("[ COPY ALL ]",   C.ACCENT,   110)
-local BtnCopyItem  = makeBtn("[ COPY SEL ]",   C.ACCENT,   100)
-local BtnSpyToggle = makeBtn("[ SPY: OFF ]",   C.SPY_COL,  110)
-local BtnClearSpy  = makeBtn("[ CLR SPY ]",    C.GREY,      90)
--- [SM-003] Button to toggle between spy view and detail view
-local BtnSpyView   = makeBtn("[ VIEW: SPY ]",  C.GREY,     100)
-
-BtnCopyItem.Visible  = false
-BtnSpyToggle.Visible = false
-BtnClearSpy.Visible  = false
-BtnSpyView.Visible   = false
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 
 -- ============================================================
--- S9  RENDER HELPERS
+-- S8  DYNAMIC DROPDOWN HELPERS
+-- Destroy old dropdown element and recreate in same tab with
+-- updated options. This is the Rayfield pattern for dynamic lists.
 -- ============================================================
 
-local function setStatus(msg)
-    pcall(function() StatusLbl.Text = tostring(msg) end)
+-- Builds a display label for a script item used in dropdown options.
+local function scriptLabel(item)
+    return item.name .. "  [" .. item.cls .. "]"
 end
 
-local function clearFrame(sf)
-    for _, child in ipairs(sf:GetChildren()) do
-        if child:IsA("TextLabel")
-            or child:IsA("Frame")
-            or child:IsA("TextButton") then
-            child:Destroy()
-        end
-    end
+-- Builds a display label for a remote item.
+local function remoteLabel(item)
+    return item.name .. "  [" .. item.cls .. "]"
 end
 
-local function renderText(sf, text, col)
-    local gen = (sf:GetAttribute("_renderGen") or 0) + 1
-    sf:SetAttribute("_renderGen", gen)
-
-    sf.CanvasSize = UDim2.new(0, 0, 0, 0)
-    clearFrame(sf)
-    col = col or C.TEXT
-
-    if not text or #text == 0 then
-        local lbl = Instance.new("TextLabel")
-        lbl.Size             = UDim2.new(1, 0, 0, 20)
-        lbl.BackgroundTransparency = 1
-        lbl.Text             = "(empty)"
-        lbl.TextColor3       = C.DIM
-        lbl.Font             = Enum.Font.Code
-        lbl.TextSize         = 11
-        lbl.TextXAlignment   = Enum.TextXAlignment.Left
-        lbl.ZIndex           = 4
-        lbl.Parent           = sf
-        return
+-- Rebuild the script browser dropdown after a scan or filter change.
+local function rebuildScriptDropdown(filterStr)
+    -- Destroy old instance if present
+    if UI.ScriptDropdown then
+        pcall(function() UI.ScriptDropdown:Destroy() end)
+        UI.ScriptDropdown = nil
     end
+    if not UI.ScriptsTab then return end
 
-    local chunks = chunkStr(text)
+    local f = (filterStr or ""):lower()
+    local options  = {}
+    local itemMap  = {}  -- label -> item
 
-    for i, chunk in ipairs(chunks) do
-        if sf:GetAttribute("_renderGen") ~= gen then return end
-
-        local lbl = Instance.new("TextLabel")
-        lbl.Name                   = "C" .. i
-        lbl.LayoutOrder            = i
-        lbl.Size                   = UDim2.new(1, 0, 0, 20)
-        lbl.BackgroundTransparency = 1
-        lbl.TextColor3             = col
-        lbl.Font                   = Enum.Font.Code
-        lbl.TextSize               = 11
-        lbl.TextXAlignment         = Enum.TextXAlignment.Left
-        lbl.TextYAlignment         = Enum.TextYAlignment.Top
-        lbl.TextWrapped            = false
-        lbl.RichText               = false
-        lbl.Text                   = chunk
-        lbl.ZIndex                 = 4
-        lbl.Parent                 = sf
-        task.wait()
-
-        if sf:GetAttribute("_renderGen") ~= gen then return end
-
-        if lbl and lbl.Parent then
-            local bounds = lbl.TextBounds
-            local h = bounds.Y + 4
-            local w = bounds.X + 14
-            lbl.Size = UDim2.new(0, math.max(w, sf.AbsoluteSize.X - 8), 0, h)
-        end
-    end
-end
-
-local function renderList(items, onSelect, filterStr)
-    clearFrame(ListScroll)
-    local filter = (filterStr or ""):lower()
-    local shown  = 0
-
-    for i, item in ipairs(items) do
-        local m = filter == ""
-            or item.name:lower():find(filter, 1, true)
-            or item.cls:lower():find(filter, 1, true)
-            or item.path:lower():find(filter, 1, true)
-        if m then
-            local btn = Instance.new("TextButton")
-            btn.Name             = "Item_" .. i
-            btn.LayoutOrder      = i
-            btn.Size             = UDim2.new(1, 0, 0, 38)
-            btn.BackgroundColor3 = C.HEADER
-            btn.Text             = ""
-            btn.BorderSizePixel  = 0
-            btn.ZIndex           = 5
-            btn.AutoButtonColor  = false
-            btn.Parent           = ListScroll
-            Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
-
-            local nameLbl = Instance.new("TextLabel")
-            nameLbl.Size             = UDim2.new(1, -6, 0, 18)
-            nameLbl.Position         = UDim2.new(0, 4, 0, 2)
-            nameLbl.BackgroundTransparency = 1
-            nameLbl.TextColor3       = C.TEXT
-            nameLbl.Font             = Enum.Font.GothamBold
-            nameLbl.TextSize         = 11
-            nameLbl.TextXAlignment   = Enum.TextXAlignment.Left
-            nameLbl.TextTruncate     = Enum.TextTruncate.AtEnd
-            nameLbl.Text             = item.name
-            nameLbl.ZIndex           = 6
-            nameLbl.Parent           = btn
-
-            local clsLbl = Instance.new("TextLabel")
-            clsLbl.Size              = UDim2.new(1, -6, 0, 14)
-            clsLbl.Position          = UDim2.new(0, 4, 0, 20)
-            clsLbl.BackgroundTransparency = 1
-            clsLbl.TextColor3        = C.DIM
-            clsLbl.Font              = Enum.Font.Code
-            clsLbl.TextSize          = 9
-            clsLbl.TextXAlignment    = Enum.TextXAlignment.Left
-            clsLbl.TextTruncate      = Enum.TextTruncate.AtEnd
-            clsLbl.Text              = "[" .. item.cls .. "]"
-            clsLbl.ZIndex            = 6
-            clsLbl.Parent            = btn
-
-            local capturedItem = item
-            -- [HK-004] List item connections don't need tracking because
-            -- they are parented to ListScroll and destroyed on clearFrame
-            btn.MouseButton1Click:Connect(function()
-                for _, c in ipairs(ListScroll:GetChildren()) do
-                    if c:IsA("TextButton") then
-                        c.BackgroundColor3 = C.HEADER
-                    end
-                end
-                btn.BackgroundColor3 = C.ACCENT
-                onSelect(capturedItem)
-            end)
-
-            shown = shown + 1
+    for _, item in ipairs(ST.scriptList) do
+        if f == ""
+            or item.name:lower():find(f, 1, true)
+            or item.cls:lower():find(f, 1, true)
+            or item.path:lower():find(f, 1, true) then
+            local lbl = scriptLabel(item)
+            options[#options + 1] = lbl
+            itemMap[lbl] = item
         end
     end
 
-    setStatus(shown .. "/" .. #items .. " shown  |  filter: '"
-        .. filter .. "'")
-end
-
--- ============================================================
--- S10  TAB SWITCHING
--- [HK-005] Spy button disabled when hookmetamethod unavailable
--- [SM-003] Manages remotesView state on tab switch
--- ============================================================
-local function switchTab(name)
-    ST.activeTab = name
-
-    -- Clear selected state on tab switch
-    ST.selectedScriptSource = nil
-    ST.selectedRemotePath   = nil
-
-    ContentScroll.Visible = false
-    ListPanel.Visible     = false
-    SourceScroll.Visible  = false
-    BtnCopyMain.Visible   = true
-    BtnCopyItem.Visible   = false
-    BtnSpyToggle.Visible  = false
-    BtnClearSpy.Visible   = false
-    BtnSpyView.Visible    = false
-    BtnCopyMain.Text      = "[ COPY ALL ]"
-
-    for tname, tb in pairs(tabButtons) do
-        if tname == name then
-            tb.BackgroundColor3 = C.ACCENT
-            tb.TextColor3       = Color3.new(1, 1, 1)
-        else
-            tb.BackgroundColor3 = C.SURFACE
-            tb.TextColor3       = C.DIM
-        end
+    local shown = #options
+    if shown == 0 then
+        options = { "(no matches — adjust filter)" }
     end
 
-    if name == "TREE" then
-        ContentScroll.Visible = true
-        BtnScan.Text          = "[ SCAN TREE ]"
-    elseif name == "SCRIPTS" then
-        ListPanel.Visible     = true
-        SourceScroll.Visible  = true
-        BtnScan.Text          = "[ SCAN SCRIPTS ]"
-        BtnCopyItem.Visible   = true
-        BtnCopyMain.Text      = "[ COPY ALL SRC ]"
-    elseif name == "REMOTES" then
-        ListPanel.Visible     = true
-        SourceScroll.Visible  = true
-        BtnScan.Text          = "[ SCAN REMOTES ]"
-        BtnCopyItem.Visible   = true
-        -- [HK-005] Only show spy controls if hookmetamethod is available
-        if hookmetamethod then
-            BtnSpyToggle.Visible  = true
-            BtnClearSpy.Visible   = true
-            -- [SM-003] Show view toggle only when spy is active
-            if ST.spyActive then
-                BtnSpyView.Visible = true
-            end
-        else
-            -- [HK-005] Show disabled spy button with N/A indicator
-            BtnSpyToggle.Visible          = true
-            BtnSpyToggle.Text             = "[ SPY: N/A ]"
-            BtnSpyToggle.BackgroundColor3 = C.GREY
-            BtnSpyToggle.Active           = false
-        end
-        -- [SM-003] Reset to detail view on tab entry
-        ST.remotesView = "detail"
-    elseif name == "PROPS" then
-        ContentScroll.Visible = true
-        BtnScan.Text          = "[ SCAN PROPS ]"
-        BtnCopyMain.Text      = "[ COPY PROPS ]"
-    end
-end
+    ST.dropdownGen = ST.dropdownGen + 1
+    local flagName = "ScriptBrowser_" .. ST.dropdownGen
 
-switchTab("TREE")
+    UI.ScriptDropdown = UI.ScriptsTab:CreateDropdown({
+        Name          = "Script Browser  (" .. shown .. " scripts)",
+        Options       = options,
+        CurrentOption = { options[1] },
+        MultipleOptions = false,
+        SearchEnabled = true,
+        Flag          = flagName,
+        Callback      = function(selected)
+            local lbl  = type(selected) == "table" and selected[1] or selected
+            local item = itemMap[lbl]
+            if not item then return end
 
-for _, tname in ipairs(TAB_NAMES) do
-    -- [HK-004] Tab button connections are GUI-parented, destroyed with ScreenGui
-    tabButtons[tname].MouseButton1Click:Connect(function()
-        switchTab(tname)
-    end)
-end
-
--- ============================================================
--- S11  SCAN ACTIONS
--- [SM-001/SM-004] releaseScan applies pending filter
--- [SM-002] Selected state cleared before pcall
--- ============================================================
-
-local applyFilter -- forward declaration for releaseScan
-
-local function releaseScan(text, label)
-    if BtnScan and BtnScan.Parent then
-        BtnScan.Active = true
-        BtnScan.Text   = label
-    end
-    ST.scanning = false
-    if text then setStatus(text) end
-
-    -- [SM-001/SM-004] Apply any filter that was queued during the scan
-    if ST.filterPending then
-        ST.filterPending = false
-        if applyFilter then
-            task.defer(applyFilter)
-        end
-    end
-end
-
--- TREE
-local function doScanTree()
-    if ST.scanning then
-        setStatus("A scan is already running. Please wait.")
-        return
-    end
-    ST.scanning    = true
-    BtnScan.Active = false
-    BtnScan.Text   = "scanning..."
-    setStatus("Building tree...")
-
-    local statusMsg = ""
-    local ok, err = pcall(function()
-        clearFrame(ContentScroll)
-        ST.treeText = nil
-        task.wait()
-
-        local result = buildTree()
-        ST.treeText = result
-
-        local f = ST.filterText:lower()
-        local display = result
-        if f ~= "" then
-            local filtered = {}
-            for line in (result .. "\n"):gmatch("([^\n]*)\n") do
-                if line:lower():find(f, 1, true) then
-                    filtered[#filtered + 1] = line
-                end
-            end
-            display = #filtered > 0
-                and table.concat(filtered, "\n")
-                or  "(no matches for '" .. f .. "')"
-        end
-
-        renderText(ContentScroll, display, C.TEXT)
-
-        local lc = 0
-        for _ in result:gmatch("\n") do lc = lc + 1 end
-        statusMsg = "Tree: " .. lc .. " lines, " .. #result .. " chars"
-    end)
-
-    releaseScan(
-        ok and statusMsg or ("[TREE ERROR] " .. tostring(err)),
-        "[ SCAN TREE ]"
-    )
-end
-
--- SCRIPTS
-local function doScanScripts()
-    if ST.scanning then
-        setStatus("A scan is already running. Please wait.")
-        return
-    end
-    ST.scanning    = true
-    BtnScan.Active = false
-    BtnScan.Text   = "scanning..."
-    setStatus("Enumerating scripts...")
-
-    -- [SM-002] Clear selected state BEFORE pcall (not inside it)
-    ST.selectedScriptSource = nil
-
-    local statusMsg = ""
-    local ok, err = pcall(function()
-        clearFrame(ListScroll)
-        clearFrame(SourceScroll)
-        ST.scriptList = {}
-        task.wait()
-
-        ST.scriptList = buildScriptList()
-
-        local function onScriptSelect(item)
             setStatus("Decompiling: " .. item.name .. "...")
-            clearFrame(SourceScroll)
-            task.wait()
-            local src, lineCount, method = decompileScript(item)
-            ST.selectedScriptSource = src
-            renderText(SourceScroll, src, C.TEXT)
-            setStatus(item.path .. "  |  " .. lineCount
-                .. " lines  |  via " .. method)
-        end
-
-        renderList(ST.scriptList, onScriptSelect, ST.filterText)
-        statusMsg = "Scripts found: " .. #ST.scriptList
-    end)
-
-    releaseScan(
-        ok and statusMsg or ("[SCRIPTS ERROR] " .. tostring(err)),
-        "[ SCAN SCRIPTS ]"
-    )
+            task.spawn(function()
+                local src, lineCount, method = decompileScript(item)
+                ST.selectedScriptSource = src
+                local statusStr = item.path .. " | " .. lineCount .. " lines | via " .. method
+                setStatus(statusStr)
+                if UI.ScriptScanLabel then
+                    pcall(function() UI.ScriptScanLabel:Set(statusStr) end)
+                end
+                if UI.ScriptParagraph then
+                    pcall(function()
+                        UI.ScriptParagraph:Set({
+                            Title   = item.name .. "  [" .. lineCount .. " lines, " .. method .. "]",
+                            Content = truncate(src, C.MAX_PARA_SOURCE),
+                        })
+                    end)
+                end
+            end)
+        end,
+    })
 end
 
+-- Rebuild the remote browser dropdown after a scan or filter change.
+local function rebuildRemoteDropdown(filterStr)
+    if UI.RemoteDropdown then
+        pcall(function() UI.RemoteDropdown:Destroy() end)
+        UI.RemoteDropdown = nil
+    end
+    if not UI.RemotesTab then return end
+
+    local f = (filterStr or ""):lower()
+    local options = {}
+    local itemMap = {}
+
+    for _, item in ipairs(ST.remoteList) do
+        if f == ""
+            or item.name:lower():find(f, 1, true)
+            or item.cls:lower():find(f, 1, true)
+            or item.path:lower():find(f, 1, true) then
+            local lbl = remoteLabel(item)
+            -- Deduplicate labels (same name + class in different paths)
+            local uniqueLbl = lbl
+            if itemMap[uniqueLbl] then
+                local count = 2
+                while itemMap[uniqueLbl .. " #" .. count] do count = count + 1 end
+                uniqueLbl = lbl .. " #" .. count
+            end
+            options[#options + 1] = uniqueLbl
+            itemMap[uniqueLbl] = item
+        end
+    end
+
+    local shown = #options
+    if shown == 0 then
+        options = { "(no matches — adjust filter)" }
+    end
+
+    ST.dropdownGen = ST.dropdownGen + 1
+    local flagName = "RemoteBrowser_" .. ST.dropdownGen
+
+    UI.RemoteDropdown = UI.RemotesTab:CreateDropdown({
+        Name          = "Remote Browser  (" .. shown .. " remotes)",
+        Options       = options,
+        CurrentOption = { options[1] },
+        MultipleOptions = false,
+        SearchEnabled = true,
+        Flag          = flagName,
+        Callback      = function(selected)
+            local lbl  = type(selected) == "table" and selected[1] or selected
+            local item = itemMap[lbl]
+            if not item then return end
+
+            ST.selectedRemotePath = item.path
+            local detail = "Name:   " .. item.name
+                .. "\nClass:  " .. item.cls
+                .. "\nPath:   " .. item.path
+                .. "\n\n-- FireServer snippet:\nlocal rem = " .. item.path
+                .. "\nrem:FireServer()"
+                .. "\n\n-- InvokeServer snippet:\nlocal rem = " .. item.path
+                .. "\nlocal result = rem:InvokeServer()"
+
+            setStatus(item.path)
+            if UI.RemoteParagraph then
+                pcall(function()
+                    UI.RemoteParagraph:Set({
+                        Title   = "Remote Detail — " .. item.name,
+                        Content = detail,
+                    })
+                end)
+            end
+        end,
+    })
+end
+
+-- ============================================================
+-- S9  SPY LINE BUILDER
+-- ============================================================
 local function buildSpyLine(name, cls, args)
     local parts = {}
     for _, a in ipairs(args) do parts[#parts + 1] = tostring(a) end
@@ -1257,572 +735,827 @@ local function buildSpyLine(name, cls, args)
         name, cls, table.concat(parts, ", "))
 end
 
+-- ============================================================
+-- S11  SCAN ACTIONS
+-- ============================================================
+
+-- TREE
+local function doScanTree()
+    if ST.scanning then
+        notify("Busy", "A scan is already running.", "clock", 3)
+        return
+    end
+    ST.scanning = true
+    setStatus("Building hierarchy tree...")
+    if UI.TreeScanLabel then
+        pcall(function() UI.TreeScanLabel:Set("Scanning...") end)
+    end
+
+    local ok, result = pcall(buildTree)
+    if not ok then
+        result = "[TREE ERROR]: " .. tostring(result)
+    end
+    ST.treeText = result
+
+    -- Apply current filter to display output
+    local f = ST.treeFilter:lower()
+    local display = result
+    if f ~= "" then
+        local filtered = {}
+        for line in (result .. "\n"):gmatch("([^\n]*)\n") do
+            if line:lower():find(f, 1, true) then
+                filtered[#filtered + 1] = line
+            end
+        end
+        display = #filtered > 0
+            and table.concat(filtered, "\n")
+            or  "(no matches for '" .. f .. "')"
+    end
+
+    local lc = 0
+    for _ in result:gmatch("\n") do lc = lc + 1 end
+    local statusStr = "Tree: " .. lc .. " lines  |  " .. #result .. " chars"
+    if f ~= "" then
+        statusStr = statusStr .. "  |  filtered"
+    end
+
+    if UI.TreeScanLabel then
+        pcall(function() UI.TreeScanLabel:Set(statusStr) end)
+    end
+    if UI.TreeParagraph then
+        pcall(function()
+            UI.TreeParagraph:Set({
+                Title   = "Hierarchy Output  (" .. lc .. " lines)",
+                Content = truncate(display, C.MAX_PARA_TREE),
+            })
+        end)
+    end
+
+    setStatus(statusStr)
+    notify("Scan Complete", statusStr, "check-circle", 4)
+    ST.scanning = false
+end
+
+-- SCRIPTS
+local function doScanScripts()
+    if ST.scanning then
+        notify("Busy", "A scan is already running.", "clock", 3)
+        return
+    end
+    ST.scanning = true
+    ST.selectedScriptSource = nil
+    setStatus("Enumerating scripts...")
+    if UI.ScriptScanLabel then
+        pcall(function() UI.ScriptScanLabel:Set("Scanning for scripts...") end)
+    end
+
+    local ok, err = pcall(function()
+        ST.scriptList = buildScriptList()
+    end)
+
+    if not ok then
+        local errStr = "[SCRIPTS ERROR]: " .. tostring(err)
+        setStatus(errStr)
+        notify("Scan Error", errStr, "alert-circle", 5)
+        ST.scanning = false
+        return
+    end
+
+    rebuildScriptDropdown(ST.scriptFilter)
+
+    local statusStr = "Scripts found: " .. #ST.scriptList
+    if UI.ScriptScanLabel then
+        pcall(function() UI.ScriptScanLabel:Set(statusStr) end)
+    end
+    if UI.ScriptParagraph then
+        pcall(function()
+            UI.ScriptParagraph:Set({
+                Title   = "Source Preview",
+                Content = "Select a script from the dropdown above to decompile and preview its source.",
+            })
+        end)
+    end
+
+    setStatus(statusStr)
+    notify("Scan Complete", statusStr, "check-circle", 4)
+    ST.scanning = false
+end
+
 -- REMOTES
 local function doScanRemotes()
     if ST.scanning then
-        setStatus("A scan is already running. Please wait.")
+        notify("Busy", "A scan is already running.", "clock", 3)
         return
     end
-    ST.scanning    = true
-    BtnScan.Active = false
-    BtnScan.Text   = "scanning..."
-    setStatus("Enumerating remotes...")
-
-    -- [SM-002] Clear selected state BEFORE pcall
+    ST.scanning = true
     ST.selectedRemotePath = nil
+    setStatus("Enumerating remotes...")
+    if UI.RemoteScanLabel then
+        pcall(function() UI.RemoteScanLabel:Set("Scanning for remotes...") end)
+    end
 
-    local statusMsg = ""
     local ok, err = pcall(function()
-        clearFrame(ListScroll)
-        clearFrame(SourceScroll)
-        ST.remoteList = {}
-        task.wait()
-
         ST.remoteList = buildRemoteList()
-
-        local function onRemoteSelect(item)
-            -- [SM-003] Switch to detail view when selecting a remote
-            ST.remotesView = "detail"
-            if BtnSpyView and BtnSpyView.Parent then
-                BtnSpyView.Text = "[ VIEW: DETAIL ]"
-            end
-
-            local detail = "REMOTE DETAIL\n"
-                .. string.rep("-", 40) .. "\n"
-                .. "Name:  " .. item.name .. "\n"
-                .. "Class: " .. item.cls  .. "\n"
-                .. "Path:  " .. item.path .. "\n\n"
-                .. "-- FireServer snippet:\n"
-                .. "local rem = " .. item.path .. "\n"
-                .. "rem:FireServer()\n\n"
-                .. "-- InvokeServer snippet:\n"
-                .. "local rem = " .. item.path .. "\n"
-                .. "local result = rem:InvokeServer()\n"
-            ST.selectedRemotePath = item.path
-            renderText(SourceScroll, detail, C.TEXT)
-            setStatus(item.path)
-        end
-
-        renderList(ST.remoteList, onRemoteSelect, ST.filterText)
-        statusMsg = "Remotes found: " .. #ST.remoteList
     end)
 
-    releaseScan(
-        ok and statusMsg or ("[REMOTES ERROR] " .. tostring(err)),
-        "[ SCAN REMOTES ]"
-    )
+    if not ok then
+        local errStr = "[REMOTES ERROR]: " .. tostring(err)
+        setStatus(errStr)
+        notify("Scan Error", errStr, "alert-circle", 5)
+        ST.scanning = false
+        return
+    end
+
+    rebuildRemoteDropdown(ST.remoteFilter)
+
+    local statusStr = "Remotes found: " .. #ST.remoteList
+    if UI.RemoteScanLabel then
+        pcall(function() UI.RemoteScanLabel:Set(statusStr) end)
+    end
+    if UI.RemoteParagraph then
+        pcall(function()
+            UI.RemoteParagraph:Set({
+                Title   = "Remote Detail",
+                Content = "Select a remote from the dropdown above to view its path and code snippets.",
+            })
+        end)
+    end
+
+    setStatus(statusStr)
+    notify("Scan Complete", statusStr, "check-circle", 4)
+    ST.scanning = false
 end
 
--- PROPS
+-- PROPERTIES
 local function doScanProps()
     if ST.scanning then
-        setStatus("A scan is already running. Please wait.")
+        notify("Busy", "A scan is already running.", "clock", 3)
         return
     end
-    ST.scanning    = true
-    BtnScan.Active = false
-    BtnScan.Text   = "scanning..."
+    ST.scanning = true
 
-    local statusMsg = ""
-    local ok, err = pcall(function()
-        clearFrame(ContentScroll)
+    local f = ST.propsPath:gsub("^%s+", ""):gsub("%s+$", "")
 
-        local hint = "PROPERTIES INSPECTOR\n"
-            .. string.rep("-", 40) .. "\n\n"
-            .. "Enter a full path in the filter bar, e.g.:\n"
-            .. "  game.Workspace.MyPart\n\n"
-            .. "Then click [ SCAN PROPS ] to inspect it.\n"
-
-        local f = ST.filterText:gsub("^%s+", ""):gsub("%s+$", "")
-
-        if f ~= "" then
-            local inst, errMsg = resolvePath(f)
-            if inst then
-                local propsText = buildPropsText(inst)
-                ST.propsText = propsText
-                renderText(ContentScroll, propsText, C.TEXT)
-                statusMsg = "Properties: " .. SP(inst, "Name")
-                    .. "  [" .. SP(inst, "ClassName") .. "]"
-            else
-                ST.propsText = hint
-                renderText(ContentScroll, hint, C.DIM)
-                statusMsg = "[PROPS] " .. (errMsg or "unknown error")
-            end
-        else
-            ST.propsText = hint
-            renderText(ContentScroll, hint, C.DIM)
-            statusMsg = "Enter an instance path in the filter bar, then click SCAN PROPS."
+    if f == "" then
+        local hint = "Enter a full instance path in the input above.\n"
+            .. "Example:  game.Workspace.Baseplate\n"
+            .. "Then press Inspect."
+        if UI.PropsParagraph then
+            pcall(function()
+                UI.PropsParagraph:Set({ Title = "Properties Inspector", Content = hint })
+            end)
         end
-    end)
+        if UI.PropsLabel then pcall(function() UI.PropsLabel:Set("Enter a path above.") end) end
+        setStatus("Enter an instance path and click Inspect.")
+        ST.scanning = false
+        return
+    end
 
-    releaseScan(
-        ok and statusMsg or ("[PROPS ERROR] " .. tostring(err)),
-        "[ SCAN PROPS ]"
-    )
+    local inst, errMsg = resolvePath(f)
+    if not inst then
+        local errStr = "[PROPS] " .. (errMsg or "unknown error")
+        if UI.PropsLabel then pcall(function() UI.PropsLabel:Set(errStr) end) end
+        if UI.PropsParagraph then
+            pcall(function()
+                UI.PropsParagraph:Set({ Title = "Resolution Failed", Content = errStr .. "\n\nCheck the path format and try again." })
+            end)
+        end
+        setStatus(errStr)
+        notify("Path Error", errStr, "alert-circle", 5)
+        ST.scanning = false
+        return
+    end
+
+    local propsText = buildPropsText(inst)
+    ST.propsText    = propsText
+    local statusStr = "Properties: " .. SP(inst, "Name") .. "  [" .. SP(inst, "ClassName") .. "]"
+
+    if UI.PropsLabel then pcall(function() UI.PropsLabel:Set(statusStr) end) end
+    if UI.PropsParagraph then
+        pcall(function()
+            UI.PropsParagraph:Set({
+                Title   = statusStr,
+                Content = truncate(propsText, C.MAX_PARA_SOURCE),
+            })
+        end)
+    end
+
+    setStatus(statusStr)
+    notify("Inspect Complete", statusStr, "layout-list", 4)
+    ST.scanning = false
 end
 
 -- ============================================================
 -- S12  REMOTE SPY
--- [HK-001] Actual hook identity verification before restore
--- [HK-002] spyHookRef stores closure reference, not boolean
--- [HK-003] Generation counter for render thread (no task.cancel dep)
--- [CL-004] Spy blocked when newcclosure is shimmed
+-- N3: origNamecall pre-captured via rawget BEFORE hookmetamethod.
+-- N4: _G.__XenoScannerNamecallOrig persists for S0.5 recovery.
+-- Luau fix: local args = {...} before nested pcall closure.
 -- ============================================================
 
--- [CL-004] Detect whether newcclosure is the identity shim
 local function isNewcclosureShimmed()
-    local testFn = function() end
+    local testFn  = function() end
     local wrapped = newcclosure(testFn)
     return wrapped == testFn
 end
 
-local function startSpy()
+local startSpy, stopSpy  -- forward declarations for toggle callback
+
+startSpy = function()
     if ST.spyActive then return end
+
     if not hookmetamethod then
-        setStatus("[SPY] hookmetamethod not available on this executor.")
+        notify("SPY UNAVAILABLE", "hookmetamethod not available on this executor.", "alert-circle", 5)
+        if UI.SpyToggle then pcall(function() UI.SpyToggle:Set(false) end) end
         return
     end
 
-    -- [CL-004] Block activation when newcclosure is shimmed (detectable hook)
     if isNewcclosureShimmed() then
-        setStatus("[SPY] BLOCKED: newcclosure unavailable. Hook would be detectable by anti-cheat.")
-        BtnSpyToggle.Text             = "[ SPY: UNSAFE ]"
-        BtnSpyToggle.BackgroundColor3 = C.WARN_COL
+        notify("SPY BLOCKED",
+            "newcclosure is unavailable. Hook would be detectable by anti-cheat.", "shield-off", 5)
+        if UI.SpyToggle then pcall(function() UI.SpyToggle:Set(false) end) end
         return
     end
 
-    ST.spyActive = true
-    ST.spyDirty  = false
-    BtnSpyToggle.Text             = "[ SPY: ON ]"
-    BtnSpyToggle.BackgroundColor3 = Color3.fromRGB(220, 80, 80)
-
-    -- [SM-003] Show view toggle and default to spy view
-    ST.remotesView = "spy"
-    if BtnSpyView then
-        BtnSpyView.Visible = true
-        BtnSpyView.Text    = "[ VIEW: SPY ]"
+    if not getrawmetatable then
+        notify("SPY ERROR", "getrawmetatable unavailable.", "alert-circle", 5)
+        if UI.SpyToggle then pcall(function() UI.SpyToggle:Set(false) end) end
+        return
     end
 
-    -- [HK-003] Increment generation counter -- old threads self-terminate
+    local mt = getrawmetatable(game)
+    if not mt then
+        notify("SPY ERROR", "Could not access game metatable.", "alert-circle", 5)
+        if UI.SpyToggle then pcall(function() UI.SpyToggle:Set(false) end) end
+        return
+    end
+
+    -- N3: capture BEFORE hook closure is created — no upvalue timing race possible.
+    local origNamecall = rawget(mt, "__namecall")
+    if not origNamecall then
+        notify("SPY ERROR", "Could not read __namecall. Already hooked or unavailable.", "alert-circle", 5)
+        if UI.SpyToggle then pcall(function() UI.SpyToggle:Set(false) end) end
+        return
+    end
+
+    -- N4: persist in _G for S0.5 recovery if this session crashes mid-spy.
+    _G.__XenoScannerNamecallOrig = origNamecall
+
+    ST.spyActive   = true
+    ST.spyDirty    = false
+    ST.spyOriginal = origNamecall
+
+    -- Generation counter: incrementing it kills any orphaned render threads.
     ST.spyGen = ST.spyGen + 1
     local myGen = ST.spyGen
 
+    -- Spy render thread — separate coroutine, never touches the hook.
     ST.spyRenderThread = task.spawn(function()
         local lastCount = 0
-        -- [HK-003] Check generation counter instead of ST.spyActive alone
         while ST.spyActive and ST.spyGen == myGen do
             if ST.spyDirty and #ST.spyLines ~= lastCount then
                 ST.spyDirty = false
                 lastCount   = #ST.spyLines
-                -- [SM-003] Only render spy output when in spy view mode
-                if ST.activeTab == "REMOTES" and ST.remotesView == "spy" then
-                    local spyText = table.concat(ST.spyLines, "\n")
-                    pcall(renderText, SourceScroll, spyText, C.SPY_COL)
-                    setStatus("SPY: " .. lastCount .. " calls captured")
+
+                -- Build display: last MAX_SPY_LINES lines
+                local lines = ST.spyLines
+                local startIdx = math.max(1, #lines - C.MAX_SPY_LINES + 1)
+                local subset = {}
+                for i = startIdx, #lines do subset[#subset + 1] = lines[i] end
+                local content = table.concat(subset, "\n")
+                if #lines > C.MAX_SPY_LINES then
+                    content = "(showing last " .. C.MAX_SPY_LINES
+                        .. " of " .. #lines .. " calls)\n\n" .. content
+                end
+
+                if UI.SpyCountLabel then
+                    pcall(function()
+                        UI.SpyCountLabel:Set("Calls captured: " .. lastCount)
+                    end)
+                end
+                if UI.SpyParagraph then
+                    pcall(function()
+                        UI.SpyParagraph:Set({
+                            Title   = "Spy Log  (" .. lastCount .. " calls)",
+                            Content = content,
+                        })
+                    end)
                 end
             end
             task.wait(C.SPY_POLL_RATE)
         end
     end)
 
-    -- [HK-002] Capture the hook closure BEFORE passing it to hookmetamethod
-    local origNamecall
+    -- Install hook. origNamecall is populated above — structurally no race.
     local ourHook = newcclosure(function(self, ...)
         local method = getnamecallmethod()
         if  method == "FireServer"
          or method == "InvokeServer"
          or method == "FireAllClients"
          or method == "Fire" then
-            local args = {...}
+            -- Luau fix: capture varargs BEFORE nested pcall closure.
+            -- Luau does not allow '...' inside a nested non-vararg function.
+            local args = { ... }
             pcall(function()
                 local ok1, cls  = pcall(function() return self.ClassName end)
-                local ok2, name = pcall(function() return self.Name      end)
+                local ok2, name = pcall(function() return self.Name end)
                 if ok1 and (
-                    cls == "RemoteEvent"           or
+                    cls == "RemoteEvent"          or
                     cls == "RemoteFunction"        or
                     cls == "BindableEvent"         or
                     cls == "BindableFunction"      or
                     cls == "UnreliableRemoteEvent") then
-                    local line = buildSpyLine(
-                        ok2 and tostring(name) or "<?>", cls, args)
+                    local line = buildSpyLine(ok2 and tostring(name) or "<?>", cls, args)
                     ST.spyLines[#ST.spyLines + 1] = line
                     ST.spyDirty = true
                 end
             end)
         end
+        -- '...' at direct scope of function(self,...) — valid Luau.
         return origNamecall(self, ...)
     end)
 
-    origNamecall = hookmetamethod(game, "__namecall", ourHook)
+    hookmetamethod(game, "__namecall", ourHook)
+    ST.spyHookRef = ourHook
 
-    ST.spyOriginal = origNamecall
-    -- [HK-002] Store actual closure reference for identity verification
-    ST.spyHookRef  = ourHook
-    setStatus("SPY ACTIVE -- intercepting all remote calls...")
+    notify("Spy Active", "Intercepting all remote calls.", "radio", 3)
+    setStatus("SPY ACTIVE — intercepting all remote calls...")
 end
 
-local function stopSpy()
+stopSpy = function()
     if not ST.spyActive then return end
     ST.spyActive = false
 
-    -- [HK-003] Increment generation to kill render thread on next wake
+    -- Kill render thread via generation increment
     ST.spyGen = ST.spyGen + 1
-
-    -- Also attempt task.cancel as a best-effort (may be shimmed)
     if ST.spyRenderThread then
         pcall(task.cancel, ST.spyRenderThread)
+        ST.spyRenderThread = nil
     end
-    ST.spyRenderThread = nil
 
-    -- [HK-001] Actual hook identity verification before restoring
+    -- Verify hook identity before restoring (HK-001)
     if hookmetamethod and ST.spyOriginal and ST.spyHookRef then
         local shouldRestore = true
-
         pcall(function()
             local mt = getrawmetatable(game)
-            if mt and mt.__namecall then
-                -- [HK-001] Compare current hook against OUR stored hook
-                -- If they don't match, another script hooked after us
-                if mt.__namecall ~= ST.spyHookRef then
-                    shouldRestore = false
-                    warn("[XenoScanner] Hook chain modified by third party -- "
-                        .. "skipping __namecall restore to preserve their hook.")
-                end
+            if mt and rawget(mt, "__namecall") ~= ST.spyHookRef then
+                shouldRestore = false
+                warn("[XenoScanner] Hook chain modified by third party — skipping restore.")
             end
         end)
-
         if shouldRestore then
-            pcall(function()
-                hookmetamethod(game, "__namecall", ST.spyOriginal)
-            end)
+            pcall(function() hookmetamethod(game, "__namecall", ST.spyOriginal) end)
         end
     end
 
     ST.spyOriginal = nil
     ST.spyHookRef  = nil
 
-    BtnSpyToggle.Text             = "[ SPY: OFF ]"
-    BtnSpyToggle.BackgroundColor3 = C.SPY_COL
-    -- [SM-003] Hide view toggle
-    if BtnSpyView then BtnSpyView.Visible = false end
-    setStatus("SPY stopped -- " .. #ST.spyLines .. " calls captured.")
+    -- N4: clear _G key — hook restored cleanly, no S0.5 recovery needed.
+    _G.__XenoScannerNamecallOrig = nil
+
+    local captured = #ST.spyLines
+    setStatus("SPY stopped — " .. captured .. " calls captured.")
+    notify("Spy Stopped", captured .. " calls captured.", "radio-tower", 4)
 end
 
 -- ============================================================
--- S13  BUTTON WIRING
--- [HK-004] All connections tracked via track() where needed
--- [SM-005] Bulk copy acquires scanning mutex
+-- S13  WINDOW + UI CONSTRUCTION
+-- N5: entire construction wrapped in pcall for real error messages.
 -- ============================================================
+local _MAIN_OK, _MAIN_ERR = pcall(function()
 
--- [HK-004] CloseBtn: GUI-parented, will disconnect on Destroy
-CloseBtn.MouseButton1Click:Connect(function()
-    if ST.spyActive then stopSpy() end
+    UI.Window = Rayfield:CreateWindow({
+        Name                   = "XENO GAME SCANNER  v4.2",
+        Icon                   = "radar",
+        LoadingTitle           = "XenoScanner v4.2",
+        LoadingSubtitle        = "Rayfield Edition",
+        Theme                  = "Default",
+        ToggleUIKeybind        = "RightShift",
+        DisableRayfieldPrompts = true,
+        DisableBuildWarnings   = true,
+        ConfigurationSaving    = { Enabled = false },
+    })
 
-    -- [HK-004] Disconnect ALL tracked connections (UIS + any others)
-    disconnectAll()
+    -- --------------------------------------------------------
+    -- TAB 1: TREE
+    -- --------------------------------------------------------
+    local TreeTab = UI.Window:CreateTab("Tree", "tree-pine")
 
-    -- Store empty table for next execution's cleanup
-    _G[SCRIPT_NAME .. "_conns"] = {}
+    TreeTab:CreateSection("Scan")
+    UI.TreeScanLabel = TreeTab:CreateLabel("Status: Ready")
+    TreeTab:CreateButton({
+        Name     = "Scan Hierarchy",
+        Callback = function() task.spawn(doScanTree) end,
+    })
 
-    pcall(function() ScreenGui:Destroy() end)
-end)
+    TreeTab:CreateSection("Filter")
+    TreeTab:CreateInput({
+        Name                   = "Filter Output",
+        PlaceholderText        = "Type to filter tree lines...",
+        RemoveTextAfterFocusLost = false,
+        Flag                   = "TreeFilterInput",
+        Callback               = function(text)
+            ST.treeFilter = text
+            if ST.scanning or not ST.treeText then return end
+            local f = text:lower()
+            local display = ST.treeText
+            if f ~= "" then
+                local filtered = {}
+                for line in (ST.treeText .. "\n"):gmatch("([^\n]*)\n") do
+                    if line:lower():find(f, 1, true) then
+                        filtered[#filtered + 1] = line
+                    end
+                end
+                display = #filtered > 0
+                    and table.concat(filtered, "\n")
+                    or  "(no matches for '" .. f .. "')"
+            end
+            if UI.TreeParagraph then
+                pcall(function()
+                    UI.TreeParagraph:Set({
+                        Title   = "Hierarchy Output (filtered)",
+                        Content = truncate(display, C.MAX_PARA_TREE),
+                    })
+                end)
+            end
+        end,
+    })
 
-HideBtn.MouseButton1Click:Connect(function()
-    ST.guiVisible = not ST.guiVisible
-    Main.Visible  = ST.guiVisible
-end)
+    TreeTab:CreateSection("Output")
+    UI.TreeParagraph = TreeTab:CreateParagraph({
+        Title   = "Hierarchy Output",
+        Content = "Click 'Scan Hierarchy' to build the full game tree.",
+    })
 
-BtnScan.MouseButton1Click:Connect(function()
-    local tab = ST.activeTab
-    if     tab == "TREE"    then task.spawn(doScanTree)
-    elseif tab == "SCRIPTS" then task.spawn(doScanScripts)
-    elseif tab == "REMOTES" then task.spawn(doScanRemotes)
-    elseif tab == "PROPS"   then task.spawn(doScanProps)
-    end
-end)
-
-BtnCopyMain.MouseButton1Click:Connect(function()
-    local tab  = ST.activeTab
-    local text = ""
-
-    if tab == "TREE" then
-        text = ST.treeText or ""
-
-    elseif tab == "SCRIPTS" then
-        if #ST.scriptList == 0 then
-            setStatus("No scripts scanned yet.")
-            return
-        end
-        -- [SM-005] Acquire scanning mutex for bulk copy
-        if ST.scanning then
-            setStatus("A scan is already running. Please wait.")
-            return
-        end
-        ST.scanning = true
-
-        local snapshot = {}
-        for i, v in ipairs(ST.scriptList) do snapshot[i] = v end
-        BtnCopyMain.Active = false
-        BtnScan.Active     = false
-        local parts = {}
-        for i, item in ipairs(snapshot) do
-            if not BtnCopyMain or not BtnCopyMain.Parent then
-                -- [SM-005] Release mutex if GUI destroyed mid-copy
-                ST.scanning = false
+    TreeTab:CreateSection("Export")
+    TreeTab:CreateButton({
+        Name     = "Copy Full Output",
+        Callback = function()
+            if not ST.treeText or ST.treeText == "" then
+                notify("Nothing to Copy", "Run a tree scan first.", "alert-circle", 3)
                 return
             end
-            setStatus("Decompiling " .. i .. "/" .. #snapshot
-                .. "  (" .. item.name .. ")...")
-            task.wait()
-            local src, lineCount, method = decompileScript(item)
-            parts[#parts + 1] = string.rep("=", 60)
-            parts[#parts + 1] = "-- [" .. i .. "]  " .. item.path
-            parts[#parts + 1] = "-- Class: " .. item.cls
-            parts[#parts + 1] = "-- Lines: " .. lineCount
-                .. "  |  Method: " .. method
-            parts[#parts + 1] = string.rep("=", 60)
-            parts[#parts + 1] = src
-            parts[#parts + 1] = ""
-        end
-        text = table.concat(parts, "\n")
-        BtnCopyMain.Active = true
-        -- [SM-005] Release scanning mutex via releaseScan
-        releaseScan(nil, "[ SCAN SCRIPTS ]")
-
-    elseif tab == "REMOTES" then
-        local rows = {}
-        for _, r in ipairs(ST.remoteList) do
-            rows[#rows + 1] = r.path .. "  [" .. r.cls .. "]"
-        end
-        text = table.concat(rows, "\n")
-
-    elseif tab == "PROPS" then
-        text = ST.propsText or ""
-    end
-
-    if text == "" then setStatus("Nothing to copy."); return end
-
-    local ok, copyErr = pcall(setclipboard, text)
-    if ok then
-        local prev = BtnCopyMain.Text
-        BtnCopyMain.Text             = "[ COPIED! ]"
-        BtnCopyMain.BackgroundColor3 = C.GREEN
-        setStatus("Copied " .. #text .. " chars to clipboard.")
-        task.delay(2.5, function()
-            if BtnCopyMain and BtnCopyMain.Parent then
-                BtnCopyMain.Text             = prev
-                BtnCopyMain.BackgroundColor3 = C.ACCENT
+            local ok, err = pcall(setclipboard, ST.treeText)
+            if ok then
+                notify("Copied", #ST.treeText .. " chars copied to clipboard.", "clipboard-check", 3)
+            else
+                notify("Copy Error", tostring(err), "alert-circle", 4)
             end
-        end)
-    else
-        setStatus("[COPY ERROR]: " .. tostring(copyErr))
-    end
-end)
+        end,
+    })
 
-BtnCopyItem.MouseButton1Click:Connect(function()
-    local tab  = ST.activeTab
-    local text = ""
+    -- --------------------------------------------------------
+    -- TAB 2: SCRIPTS
+    -- --------------------------------------------------------
+    local ScriptsTab = UI.Window:CreateTab("Scripts", "scroll-text")
+    UI.ScriptsTab = ScriptsTab  -- stored so rebuildScriptDropdown can add to it
 
-    if tab == "SCRIPTS" then
-        text = ST.selectedScriptSource or ""
-    elseif tab == "REMOTES" then
-        text = ST.selectedRemotePath or ""
-    end
+    ScriptsTab:CreateSection("Scan")
+    UI.ScriptScanLabel = ScriptsTab:CreateLabel("Status: Ready")
+    ScriptsTab:CreateButton({
+        Name     = "Scan Scripts",
+        Callback = function() task.spawn(doScanScripts) end,
+    })
 
-    if text == "" then setStatus("Select an item first."); return end
-    local ok, copyErr = pcall(setclipboard, text)
-    if ok then
-        local prev = BtnCopyItem.Text
-        BtnCopyItem.Text             = "[ COPIED! ]"
-        BtnCopyItem.BackgroundColor3 = C.GREEN
-        setStatus("Copied " .. #text .. " chars.")
-        task.delay(2.5, function()
-            if BtnCopyItem and BtnCopyItem.Parent then
-                BtnCopyItem.Text             = prev
-                BtnCopyItem.BackgroundColor3 = C.ACCENT
+    ScriptsTab:CreateSection("Filter")
+    ScriptsTab:CreateInput({
+        Name                   = "Filter Scripts",
+        PlaceholderText        = "Filter by name, class, or path...",
+        RemoveTextAfterFocusLost = false,
+        Flag                   = "ScriptFilterInput",
+        Callback               = function(text)
+            ST.scriptFilter = text
+            if ST.scanning then return end
+            if #ST.scriptList > 0 then
+                rebuildScriptDropdown(text)
             end
-        end)
-    else
-        setStatus("[COPY ERROR]: " .. tostring(copyErr))
-    end
-end)
+        end,
+    })
 
-BtnSpyToggle.MouseButton1Click:Connect(function()
-    if ST.spyActive then stopSpy() else startSpy() end
-end)
+    ScriptsTab:CreateSection("Script Browser")
+    -- Initial placeholder dropdown — replaced after scan
+    UI.ScriptDropdown = ScriptsTab:CreateDropdown({
+        Name            = "Script Browser  (scan first)",
+        Options         = { "(run Scan Scripts first)" },
+        CurrentOption   = { "(run Scan Scripts first)" },
+        MultipleOptions = false,
+        SearchEnabled   = false,
+        Flag            = "ScriptBrowser_0",
+        Callback        = function() end,
+    })
 
-BtnClearSpy.MouseButton1Click:Connect(function()
-    ST.spyLines = {}
-    clearFrame(SourceScroll)
-    setStatus("Spy log cleared.")
-end)
+    ScriptsTab:CreateSection("Source Preview")
+    UI.ScriptParagraph = ScriptsTab:CreateParagraph({
+        Title   = "Source Preview",
+        Content = "Select a script from the browser above after scanning.",
+    })
 
--- [SM-003] View toggle button wiring
-BtnSpyView.MouseButton1Click:Connect(function()
-    if ST.remotesView == "spy" then
-        ST.remotesView = "detail"
-        BtnSpyView.Text = "[ VIEW: DETAIL ]"
-        -- Show last selected remote detail if available
-        if ST.selectedRemotePath then
-            setStatus("Switched to detail view: " .. ST.selectedRemotePath)
-        else
-            clearFrame(SourceScroll)
-            setStatus("Detail view -- select a remote from the list.")
-        end
-    else
-        ST.remotesView = "spy"
-        BtnSpyView.Text = "[ VIEW: SPY ]"
-        -- Immediately render spy data
-        if #ST.spyLines > 0 then
-            local spyText = table.concat(ST.spyLines, "\n")
-            pcall(renderText, SourceScroll, spyText, C.SPY_COL)
-            setStatus("SPY: " .. #ST.spyLines .. " calls captured")
-        else
-            clearFrame(SourceScroll)
-            setStatus("Spy view -- waiting for remote calls...")
-        end
-    end
-end)
-
--- ============================================================
--- S14  FILTER
--- [SM-001/SM-004] applyFilter respects scanning mutex
--- ============================================================
-
-local function makeScriptSelectFn()
-    return function(item)
-        setStatus("Decompiling: " .. item.name .. "...")
-        clearFrame(SourceScroll)
-        task.wait()
-        local src, lineCount, method = decompileScript(item)
-        ST.selectedScriptSource = src
-        renderText(SourceScroll, src, C.TEXT)
-        setStatus(item.path .. "  |  " .. lineCount
-            .. " lines  |  via " .. method)
-    end
-end
-
-local function makeRemoteSelectFn()
-    return function(item)
-        -- [SM-003] Switch to detail view on selection
-        ST.remotesView = "detail"
-        if BtnSpyView and BtnSpyView.Parent then
-            BtnSpyView.Text = "[ VIEW: DETAIL ]"
-        end
-        ST.selectedRemotePath = item.path
-        local detail = "Path:  " .. item.path .. "\nClass: " .. item.cls
-        renderText(SourceScroll, detail, C.TEXT)
-        setStatus(item.path)
-    end
-end
-
--- [SM-001/SM-004] applyFilter with scanning mutex check
-applyFilter = function()
-    -- [SM-001] Block filter during active scan, defer it
-    if ST.scanning then
-        ST.filterPending = true
-        return
-    end
-
-    local f = ST.filterText:lower()
-    local tab = ST.activeTab
-
-    if tab == "TREE" and ST.treeText then
-        if f == "" then
-            renderText(ContentScroll, ST.treeText, C.TEXT)
-        else
-            local filtered = {}
-            for line in (ST.treeText .. "\n"):gmatch("([^\n]*)\n") do
-                if line:lower():find(f, 1, true) then
-                    filtered[#filtered + 1] = line
+    ScriptsTab:CreateSection("Export")
+    ScriptsTab:CreateButton({
+        Name     = "Copy Selected Source",
+        Callback = function()
+            local text = ST.selectedScriptSource or ""
+            if text == "" then
+                notify("Nothing Selected", "Select a script first.", "alert-circle", 3)
+                return
+            end
+            local ok, err = pcall(setclipboard, text)
+            if ok then
+                notify("Copied", #text .. " chars copied.", "clipboard-check", 3)
+            else
+                notify("Copy Error", tostring(err), "alert-circle", 4)
+            end
+        end,
+    })
+    ScriptsTab:CreateButton({
+        Name     = "Copy All Sources (bulk decompile)",
+        Callback = function()
+            if #ST.scriptList == 0 then
+                notify("No Scripts", "Run Scan Scripts first.", "alert-circle", 3)
+                return
+            end
+            if ST.scanning then
+                notify("Busy", "A scan is already running.", "clock", 3)
+                return
+            end
+            ST.scanning = true
+            task.spawn(function()
+                local snapshot = {}
+                for i, v in ipairs(ST.scriptList) do snapshot[i] = v end
+                notify("Bulk Decompile", "Decompiling " .. #snapshot .. " scripts...", "loader", 4)
+                local parts = {}
+                for i, item in ipairs(snapshot) do
+                    setStatus("Decompiling " .. i .. "/" .. #snapshot .. " — " .. item.name)
+                    task.wait()
+                    local src, lineCount, method = decompileScript(item)
+                    parts[#parts + 1] = string.rep("=", 60)
+                    parts[#parts + 1] = "-- [" .. i .. "]  " .. item.path
+                    parts[#parts + 1] = "-- Class: " .. item.cls
+                    parts[#parts + 1] = "-- Lines: " .. lineCount .. "  |  Method: " .. method
+                    parts[#parts + 1] = string.rep("=", 60)
+                    parts[#parts + 1] = src
+                    parts[#parts + 1] = ""
                 end
+                local allSrc = table.concat(parts, "\n")
+                ST.scanning = false
+                local ok, err = pcall(setclipboard, allSrc)
+                if ok then
+                    notify("Bulk Copy Done", #allSrc .. " chars copied.", "clipboard-check", 5)
+                    setStatus("Bulk copy: " .. #allSrc .. " chars copied.")
+                else
+                    notify("Copy Error", tostring(err), "alert-circle", 5)
+                end
+            end)
+        end,
+    })
+
+    -- --------------------------------------------------------
+    -- TAB 3: REMOTES
+    -- --------------------------------------------------------
+    local RemotesTab = UI.Window:CreateTab("Remotes", "radio")
+    UI.RemotesTab = RemotesTab
+
+    RemotesTab:CreateSection("Scan")
+    UI.RemoteScanLabel = RemotesTab:CreateLabel("Status: Ready")
+    RemotesTab:CreateButton({
+        Name     = "Scan Remotes",
+        Callback = function() task.spawn(doScanRemotes) end,
+    })
+
+    RemotesTab:CreateSection("Filter")
+    RemotesTab:CreateInput({
+        Name                   = "Filter Remotes",
+        PlaceholderText        = "Filter by name, class, or path...",
+        RemoveTextAfterFocusLost = false,
+        Flag                   = "RemoteFilterInput",
+        Callback               = function(text)
+            ST.remoteFilter = text
+            if ST.scanning then return end
+            if #ST.remoteList > 0 then
+                rebuildRemoteDropdown(text)
             end
-            local display = #filtered > 0
-                and table.concat(filtered, "\n")
-                or  "(no matches for '" .. f .. "')"
-            renderText(ContentScroll, display, C.TEXT)
-            setStatus(#filtered .. " lines match '" .. f .. "'")
-        end
+        end,
+    })
 
-    elseif tab == "SCRIPTS" and #ST.scriptList > 0 then
-        renderList(ST.scriptList, makeScriptSelectFn(), ST.filterText)
+    RemotesTab:CreateSection("Remote Browser")
+    UI.RemoteDropdown = RemotesTab:CreateDropdown({
+        Name            = "Remote Browser  (scan first)",
+        Options         = { "(run Scan Remotes first)" },
+        CurrentOption   = { "(run Scan Remotes first)" },
+        MultipleOptions = false,
+        SearchEnabled   = false,
+        Flag            = "RemoteBrowser_0",
+        Callback        = function() end,
+    })
 
-    elseif tab == "REMOTES" and #ST.remoteList > 0 then
-        renderList(ST.remoteList, makeRemoteSelectFn(), ST.filterText)
+    RemotesTab:CreateSection("Remote Detail")
+    UI.RemoteParagraph = RemotesTab:CreateParagraph({
+        Title   = "Remote Detail",
+        Content = "Select a remote from the browser above after scanning.",
+    })
+
+    RemotesTab:CreateSection("Export")
+    RemotesTab:CreateButton({
+        Name     = "Copy Remote List",
+        Callback = function()
+            if #ST.remoteList == 0 then
+                notify("No Remotes", "Run Scan Remotes first.", "alert-circle", 3)
+                return
+            end
+            local rows = {}
+            for _, r in ipairs(ST.remoteList) do
+                rows[#rows + 1] = r.path .. "  [" .. r.cls .. "]"
+            end
+            local text = table.concat(rows, "\n")
+            local ok, err = pcall(setclipboard, text)
+            if ok then
+                notify("Copied", #ST.remoteList .. " remotes copied.", "clipboard-check", 3)
+            else
+                notify("Copy Error", tostring(err), "alert-circle", 4)
+            end
+        end,
+    })
+    RemotesTab:CreateButton({
+        Name     = "Copy Selected Remote Path",
+        Callback = function()
+            local text = ST.selectedRemotePath or ""
+            if text == "" then
+                notify("Nothing Selected", "Select a remote from the browser.", "alert-circle", 3)
+                return
+            end
+            local ok, err = pcall(setclipboard, text)
+            if ok then
+                notify("Copied", text, "clipboard-check", 3)
+            else
+                notify("Copy Error", tostring(err), "alert-circle", 4)
+            end
+        end,
+    })
+
+    RemotesTab:CreateSection("Remote Spy")
+    if not hookmetamethod then
+        RemotesTab:CreateLabel("SPY UNAVAILABLE — hookmetamethod not present on this executor.")
+    else
+        UI.SpyToggle = RemotesTab:CreateToggle({
+            Name         = "Spy Active",
+            CurrentValue = false,
+            Flag         = "SpyActiveToggle",
+            Callback     = function(value)
+                if value then startSpy() else stopSpy() end
+            end,
+        })
+        RemotesTab:CreateButton({
+            Name     = "Clear Spy Log",
+            Callback = function()
+                ST.spyLines = {}
+                if UI.SpyCountLabel then
+                    pcall(function() UI.SpyCountLabel:Set("Calls captured: 0") end)
+                end
+                if UI.SpyParagraph then
+                    pcall(function()
+                        UI.SpyParagraph:Set({ Title = "Spy Log", Content = "(cleared)" })
+                    end)
+                end
+                setStatus("Spy log cleared.")
+                notify("Spy Log Cleared", "All captured calls removed.", "trash-2", 3)
+            end,
+        })
+        RemotesTab:CreateButton({
+            Name     = "Copy Spy Log",
+            Callback = function()
+                if #ST.spyLines == 0 then
+                    notify("Empty Log", "No calls captured yet. Enable spy first.", "alert-circle", 3)
+                    return
+                end
+                local text = table.concat(ST.spyLines, "\n")
+                local ok, err = pcall(setclipboard, text)
+                if ok then
+                    notify("Copied", #ST.spyLines .. " spy entries copied.", "clipboard-check", 3)
+                else
+                    notify("Copy Error", tostring(err), "alert-circle", 4)
+                end
+            end,
+        })
     end
-end
 
--- Generation-counter debounce for filter input
--- [HK-004] Connection is GUI-parented, destroyed with FilterInput
-FilterInput:GetPropertyChangedSignal("Text"):Connect(function()
-    ST.filterText = FilterInput.Text
-    ST.filterGen  = ST.filterGen + 1
-    local myGen   = ST.filterGen
-    task.delay(C.FILTER_DEBOUNCE, function()
-        if ST.filterGen == myGen then
-            applyFilter()
-        end
-    end)
-end)
+    RemotesTab:CreateSection("Spy Output")
+    UI.SpyCountLabel = RemotesTab:CreateLabel("Calls captured: 0")
+    UI.SpyParagraph  = RemotesTab:CreateParagraph({
+        Title   = "Spy Log",
+        Content = "Enable the spy toggle above to begin intercepting remote calls.",
+    })
 
-FilterClear.MouseButton1Click:Connect(function()
-    ST.filterGen = ST.filterGen + 1
-    FilterInput.Text = ""
-    ST.filterText    = ""
-    applyFilter()
-end)
+    -- --------------------------------------------------------
+    -- TAB 4: PROPERTIES
+    -- --------------------------------------------------------
+    local PropsTab = UI.Window:CreateTab("Properties", "layout-list")
 
--- ============================================================
--- S15  DRAG
--- [HK-004] UIS connections tracked via track()
--- ============================================================
-local dragging, dragStart, dragOrigin
+    PropsTab:CreateSection("Path Input")
+    PropsTab:CreateParagraph({
+        Title   = "Usage",
+        Content = "Enter a full instance path below, then click Inspect.\n"
+            .. "Example: game.Workspace.Baseplate\n"
+            .. "Paths must start with 'game' and use dot notation.",
+    })
+    UI.PropsInput = PropsTab:CreateInput({
+        Name                   = "Instance Path",
+        PlaceholderText        = "game.Workspace.BasePlate",
+        RemoveTextAfterFocusLost = false,
+        Flag                   = "PropsPathInput",
+        Callback               = function(text)
+            ST.propsPath = text
+        end,
+    })
+    PropsTab:CreateButton({
+        Name     = "Inspect",
+        Callback = function() task.spawn(doScanProps) end,
+    })
 
-TitleBar.InputBegan:Connect(function(inp)
-    if inp.UserInputType == Enum.UserInputType.MouseButton1 then
-        dragging   = true
-        dragStart  = inp.Position
-        dragOrigin = Main.Position
-    end
-end)
+    PropsTab:CreateSection("Properties Output")
+    UI.PropsLabel     = PropsTab:CreateLabel("Status: Enter a path above.")
+    UI.PropsParagraph = PropsTab:CreateParagraph({
+        Title   = "Properties",
+        Content = "Enter an instance path and click Inspect.",
+    })
 
-TitleBar.InputEnded:Connect(function(inp)
-    if inp.UserInputType == Enum.UserInputType.MouseButton1 then
-        dragging = false
-    end
-end)
+    PropsTab:CreateSection("Export")
+    PropsTab:CreateButton({
+        Name     = "Copy Properties",
+        Callback = function()
+            local text = ST.propsText or ""
+            if text == "" then
+                notify("Nothing to Copy", "Run an Inspect first.", "alert-circle", 3)
+                return
+            end
+            local ok, err = pcall(setclipboard, text)
+            if ok then
+                notify("Copied", #text .. " chars copied.", "clipboard-check", 3)
+            else
+                notify("Copy Error", tostring(err), "alert-circle", 4)
+            end
+        end,
+    })
 
--- [HK-004] Track UIS connection for cleanup on close
-track(UIS.InputChanged:Connect(function(inp)
-    if not Main or not Main.Parent then
-        dragging = false
-        return
-    end
-    if dragging and inp.UserInputType == Enum.UserInputType.MouseMovement then
-        local d = inp.Position - dragStart
-        Main.Position = UDim2.new(
-            dragOrigin.X.Scale, dragOrigin.X.Offset + d.X,
-            dragOrigin.Y.Scale, dragOrigin.Y.Offset + d.Y)
-    end
-end))
+    -- --------------------------------------------------------
+    -- TAB 5: INFO
+    -- --------------------------------------------------------
+    local InfoTab = UI.Window:CreateTab("Info", "info")
 
--- ============================================================
--- S16  KEYBIND  (RightShift toggles GUI visibility)
--- [HK-004] Track UIS connection for cleanup on close
--- ============================================================
-track(UIS.InputBegan:Connect(function(inp, gpe)
-    if not Main or not Main.Parent then return end
-    if not gpe and inp.KeyCode == Enum.KeyCode.RightShift then
-        ST.guiVisible = not ST.guiVisible
-        Main.Visible  = ST.guiVisible
-    end
-end))
+    InfoTab:CreateSection("Live Status")
+    UI.StatusLabel = InfoTab:CreateLabel("XenoScanner v4.2 — Ready.")
 
--- [HK-004] Store connection references in _G for cross-execution cleanup
-_G[SCRIPT_NAME .. "_conns"] = _connections
+    InfoTab:CreateSection("About")
+    UI.InfoParagraph = InfoTab:CreateParagraph({
+        Title   = "XenoScanner v4.2  —  Rayfield Edition",
+        Content = "Backend: v4.2 (rawget hook pre-capture, _G persistence, pcall wrapper)\n"
+            .. "GUI: Rayfield Build 1.68\n\n"
+            .. "Keybind: RightShift  —  toggle GUI visibility\n\n"
+            .. "TABS\n"
+            .. "  Tree       —  Full DataModel hierarchy scan\n"
+            .. "  Scripts    —  Enumerate + decompile all scripts\n"
+            .. "  Remotes    —  Enumerate remotes + live spy\n"
+            .. "  Properties —  Inspect any instance by path\n\n"
+            .. "LOAD VIA BOOTSTRAP.LUA\n"
+            .. "Do not use loadstring(game:HttpGet(...))() directly.\n"
+            .. "The bootstrap uses http_request to bypass __namecall\n"
+            .. "so it loads safely even if a prior spy session crashed.",
+    })
+
+    InfoTab:CreateSection("Danger Zone")
+    InfoTab:CreateButton({
+        Name     = "Force Stop Spy + Restore Hook",
+        Callback = function()
+            if ST.spyActive then
+                stopSpy()
+                if UI.SpyToggle then pcall(function() UI.SpyToggle:Set(false) end) end
+            else
+                notify("Spy Inactive", "Spy is not currently running.", "info", 3)
+            end
+        end,
+    })
+    InfoTab:CreateButton({
+        Name     = "Close Scanner",
+        Callback = function()
+            if ST.spyActive then stopSpy() end
+            disconnectAll()
+            _G[SCRIPT_NAME .. "_conns"] = {}
+            pcall(function() Rayfield:Destroy() end)
+        end,
+    })
+
+end) -- end pcall main body (N5)
 
 -- ============================================================
 -- S17  INIT
 -- ============================================================
-setStatus("XenoScanner v4.1  --  GUI parent: " .. tostring(GUI_PARENT))
-print("[XenoScanner v4.1] Loaded. GUI parent: " .. tostring(GUI_PARENT))
+
+-- Store tracked connections for cross-execution cleanup
+_G[SCRIPT_NAME .. "_conns"] = _connections
+
+if _MAIN_OK then
+    setStatus("XenoScanner v4.2 — GUI parent: " .. tostring(GUI_PARENT))
+    print("[XenoScanner v4.2 Rayfield] Loaded. GUI parent: " .. tostring(GUI_PARENT))
+else
+    -- N5: real error message with real line number
+    print("[XenoScanner v4.2 Rayfield] FATAL INIT ERROR: " .. tostring(_MAIN_ERR))
+end
