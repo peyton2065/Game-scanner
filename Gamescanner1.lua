@@ -1,9 +1,19 @@
 -- XenoScanner v4.2  --  Rayfield Edition  --  Production  --  Safe re-execute
 -- Tabs: TREE | SCRIPTS | REMOTES | PROPERTIES | INFO
--- Keybind: RightShift = toggle GUI  (Rayfield native)
+-- Keybind: RightShift = toggle GUI  (UIS fallback — Rayfield:SetVisibility)
 -- Load via Bootstrap.lua -- do NOT use raw loadstring(game:HttpGet(...))()
 -- ============================================================
 -- CHANGELOG
+-- v4.2 Rayfield Fix Pass:
+--   H1: Removed ToggleUIKeybind from CreateWindow — crashes strict Rayfield
+--       builds regardless of string vs Enum.KeyCode value. UIS fallback added
+--       at bottom of construction block using Rayfield:SetVisibility().
+--   H2: notify() now calls Rayfield:Notify() — UI.Window:Notify() does not
+--       exist. Prior version silently ate every notification via pcall.
+--   S1: Dropdown rebuild pattern fixed. Placeholder dropdowns removed from
+--       window construction. rebuildScriptDropdown / rebuildRemoteDropdown
+--       now guard :Destroy() with a success check — if Rayfield's table
+--       doesn't implement it, creation is skipped to prevent stacking.
 -- v4.2 Rayfield: Full Rayfield GUI rewrite. All v4.2 backend fixes preserved.
 --   N2: S0.5 early __namecall hook recovery (_G persistence)
 --   N3: startSpy uses rawget pre-capture -- timing race structurally impossible
@@ -291,16 +301,16 @@ local function setStatus(msg)
 end
 
 local function notify(title, content, icon, duration)
-    if UI.Window then
-        pcall(function()
-            UI.Window:Notify({
-                Title    = title or "XenoScanner",
-                Content  = content or "",
-                Duration = duration or 4,
-                Image    = icon or "info",
-            })
-        end)
-    end
+    -- Rayfield:Notify() is the correct API. UI.Window:Notify() does not exist.
+    -- pcall guards against edge cases where Rayfield itself is not yet ready.
+    pcall(function()
+        Rayfield:Notify({
+            Title    = title or "XenoScanner",
+            Content  = content or "",
+            Duration = duration or 4,
+            Image    = icon or "info",
+        })
+    end)
 end
 
 -- ============================================================
@@ -588,11 +598,27 @@ local function remoteLabel(item)
 end
 
 -- Rebuild the script browser dropdown after a scan or filter change.
+-- FIX S1: Rayfield element tables may not implement :Destroy().
+-- Pattern: create once (when nil), never destroy. Filter changes re-create
+-- only when dropdown doesn't exist yet. Stale options are unavoidable
+-- without a proper :SetOptions() API — live search via SearchEnabled handles it.
 local function rebuildScriptDropdown(filterStr)
-    -- Destroy old instance if present
+    -- If dropdown already exists, we cannot cleanly update its options
+    -- without destroying it. Attempt destroy with pcall; if it fails,
+    -- the old one stays and the new one won't be added (nil guard below
+    -- prevents double-creation in that case).
     if UI.ScriptDropdown then
-        pcall(function() UI.ScriptDropdown:Destroy() end)
-        UI.ScriptDropdown = nil
+        local destroyed = false
+        pcall(function()
+            UI.ScriptDropdown:Destroy()
+            destroyed = true
+        end)
+        if destroyed then
+            UI.ScriptDropdown = nil
+        else
+            -- Destroy failed — old dropdown still live. Don't stack another.
+            return
+        end
     end
     if not UI.ScriptsTab then return end
 
@@ -654,10 +680,19 @@ local function rebuildScriptDropdown(filterStr)
 end
 
 -- Rebuild the remote browser dropdown after a scan or filter change.
+-- FIX S1: Same create-once pattern as rebuildScriptDropdown.
 local function rebuildRemoteDropdown(filterStr)
     if UI.RemoteDropdown then
-        pcall(function() UI.RemoteDropdown:Destroy() end)
-        UI.RemoteDropdown = nil
+        local destroyed = false
+        pcall(function()
+            UI.RemoteDropdown:Destroy()
+            destroyed = true
+        end)
+        if destroyed then
+            UI.RemoteDropdown = nil
+        else
+            return
+        end
     end
     if not UI.RemotesTab then return end
 
@@ -1130,7 +1165,8 @@ local _MAIN_OK, _MAIN_ERR = pcall(function()
         LoadingTitle           = "XenoScanner v4.2",
         LoadingSubtitle        = "Rayfield Edition",
         Theme                  = "Default",
-        ToggleUIKeybind        = Enum.KeyCode.RightShift,
+        -- ToggleUIKeybind removed: Rayfield validates type strictly and crashes
+        -- on any value it doesn't expect. UIS fallback handles RightShift below.
         DisableRayfieldPrompts = true,
         DisableBuildWarnings   = true,
         ConfigurationSaving    = { Enabled = false },
@@ -1233,16 +1269,10 @@ local _MAIN_OK, _MAIN_ERR = pcall(function()
     })
 
     ScriptsTab:CreateSection("Script Browser")
-    -- Initial placeholder dropdown — replaced after scan
-    UI.ScriptDropdown = ScriptsTab:CreateDropdown({
-        Name            = "Script Browser  (scan first)",
-        Options         = { "(run Scan Scripts first)" },
-        CurrentOption   = { "(run Scan Scripts first)" },
-        MultipleOptions = false,
-        SearchEnabled   = false,
-        Flag            = "ScriptBrowser_0",
-        Callback        = function() end,
-    })
+    -- FIX S1: No placeholder dropdown. Dropdown is created dynamically after
+    -- the first scan via rebuildScriptDropdown(). Creating a placeholder and
+    -- then destroying it risks stacking elements if :Destroy() is unavailable.
+    ScriptsTab:CreateLabel("Run 'Scan Scripts' to populate the browser below.")
 
     ScriptsTab:CreateSection("Source Preview")
     UI.ScriptParagraph = ScriptsTab:CreateParagraph({
@@ -1338,15 +1368,8 @@ local _MAIN_OK, _MAIN_ERR = pcall(function()
     })
 
     RemotesTab:CreateSection("Remote Browser")
-    UI.RemoteDropdown = RemotesTab:CreateDropdown({
-        Name            = "Remote Browser  (scan first)",
-        Options         = { "(run Scan Remotes first)" },
-        CurrentOption   = { "(run Scan Remotes first)" },
-        MultipleOptions = false,
-        SearchEnabled   = false,
-        Flag            = "RemoteBrowser_0",
-        Callback        = function() end,
-    })
+    -- FIX S1: Same as Scripts tab — no placeholder. Dropdown created after scan.
+    RemotesTab:CreateLabel("Run 'Scan Remotes' to populate the browser below.")
 
     RemotesTab:CreateSection("Remote Detail")
     UI.RemoteParagraph = RemotesTab:CreateParagraph({
@@ -1542,6 +1565,19 @@ local _MAIN_OK, _MAIN_ERR = pcall(function()
             pcall(function() Rayfield:Destroy() end)
         end,
     })
+
+    -- --------------------------------------------------------
+    -- KEYBIND: RightShift toggles GUI visibility
+    -- Handled via UIS because ToggleUIKeybind in CreateWindow
+    -- crashes on strict Rayfield builds. Rayfield:SetVisibility()
+    -- is the correct programmatic toggle API.
+    -- --------------------------------------------------------
+    track(UIS.InputBegan:Connect(function(inp, gpe)
+        if not gpe and inp.KeyCode == Enum.KeyCode.RightShift then
+            local visible = Rayfield:IsVisible()
+            Rayfield:SetVisibility(not visible)
+        end
+    end))
 
 end) -- end pcall main body (N5)
 
