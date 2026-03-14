@@ -1264,6 +1264,11 @@ local function startSpy()
              or method == "InvokeServer"
              or method == "FireAllClients"
              or method == "Fire" then
+                -- Capture varargs HERE, in the vararg function, before the
+                -- nested pcall(function()...end) which is NOT vararg.
+                -- Using {...} inside that inner function is a Luau error:
+                -- "Cannot use '...' outside of a vararg function".
+                local args = { ... }
                 -- FIX 2.1: NO yields here. pcall, string ops, table append only.
                 pcall(function()
                     local ok1, cls  = pcall(function() return self.ClassName end)
@@ -1274,9 +1279,8 @@ local function startSpy()
                         cls == "BindableEvent"          or
                         cls == "BindableFunction"       or
                         cls == "UnreliableRemoteEvent") then
-                        local argList = { ... }
                         local line = buildSpyLine(
-                            ok2 and tostring(name) or "<?>", cls, argList)
+                            ok2 and tostring(name) or "<?>", cls, args)
                         ST.spyLines[#ST.spyLines + 1] = line
                         ST.spyDirty = true
                     end
