@@ -638,10 +638,45 @@ end
 
 -- ============================================================
 -- RAYFIELD LOAD
--- Runs after S0.5 has restored any broken hook, so game:HttpGet
--- goes through a clean __namecall and will not crash.
+-- SX6: On Syntax, game:HttpGet routes through __namecall on the game
+-- object. This wakes Roblox's CoreGui flag modules (GetFFlagIsStudio etc.)
+-- whose dot-notation calls (RunService.IsStudio()) are rejected by Syntax's
+-- strict Luau VM: "Expected ':' not '.' calling member function IsStudio".
+-- Fix: on Syntax use request() / http_request() -- direct C-functions that
+-- never enter __namecall and never touch CoreGui.
+-- On all other executors the standard game:HttpGet path is used.
 -- ============================================================
-local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+local Rayfield
+do
+    local RAYFIELD_URL = "https://sirius.menu/rayfield"
+    if IS_SYNTAX then
+        -- Prefer executor HTTP APIs that bypass __namecall entirely.
+        -- Try all known naming conventions in order of prevalence.
+        local httpFn = rawget(_G, "request")
+            or rawget(_G, "http_request")
+            or (rawget(_G, "syn") and rawget(rawget(_G, "syn"), "request"))
+        local loaded = false
+        if httpFn then
+            local ok, resp = pcall(httpFn, { Url = RAYFIELD_URL, Method = "GET" })
+            if ok and type(resp) == "table" and type(resp.Body) == "string" then
+                local ok2, result = pcall(loadstring(resp.Body))
+                if ok2 then
+                    Rayfield = result
+                    loaded   = true
+                end
+            end
+        end
+        if not loaded then
+            -- Last resort: game:HttpGet with the __namecall risk accepted.
+            -- If this still crashes, use a bootstrap that pre-loads Rayfield
+            -- via http_request before running this script.
+            Rayfield = loadstring(game:HttpGet(RAYFIELD_URL))()
+        end
+    else
+        -- Non-Syntax executors: standard path, clean __namecall.
+        Rayfield = loadstring(game:HttpGet(RAYFIELD_URL))()
+    end
+end
 
 -- ============================================================
 -- S8  DYNAMIC DROPDOWN HELPERS
